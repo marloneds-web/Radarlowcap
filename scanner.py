@@ -1,3 +1,5 @@
+# scanner.py — COMPLETO E CORRIGIDO
+
 import ta
 import numpy as np
 from exchanges import obter_candles, listar_lowcaps
@@ -19,7 +21,8 @@ from utils import SCORE_MINIMO, TOP_N_MOEDAS, TIMEFRAME_PADRAO
 
 def _esc(text: str) -> str:
     """Escapa todos os caracteres especiais do MarkdownV2."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
+    text = str(text)
+    for ch in r"\_*[]()~`>#+-=|{}.!:":
         text = text.replace(ch, f"\\{ch}")
     return text
 
@@ -35,10 +38,10 @@ def _formatar_mtf(valor: str) -> str:
 
 def _fmt_price(price: float) -> str:
     """Formata preço de acordo com a magnitude."""
-    if price < 0.0001:   return f"{price:.8f}"
-    elif price < 1:      return f"{price:.6f}"
-    elif price < 1000:   return f"{price:.4f}"
-    else:                return f"{price:,.2f}"
+    if price < 0.0001:  return f"{price:.8f}"
+    elif price < 1:     return f"{price:.6f}"
+    elif price < 1000:  return f"{price:.4f}"
+    else:               return f"{price:,.2f}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -62,10 +65,10 @@ def escanear_lowcaps(
             if df is None or len(df) < 100:
                 continue
 
-            mtf, confluencia           = analise_multi_timeframe(par)
-            score, breakdown, fase_amd = calcular_score_final(df, par, confluencia)
-            direcao, _, _              = avaliar_tendencia(df)
-            sq                         = calcular_squeeze_pro(df)
+            mtf, confluencia            = analise_multi_timeframe(par)
+            score, breakdown, fase_amd  = calcular_score_final(df, par, confluencia)
+            direcao, _, _               = avaliar_tendencia(df)
+            sq                          = calcular_squeeze_pro(df)
             rsi      = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
             vol_ma21 = df["volume"].rolling(21).mean().iloc[-1]
             vol_ratio = df["volume"].iloc[-1] / vol_ma21 if vol_ma21 > 0 else 0
@@ -114,7 +117,7 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
 
     linhas = [
         f"🏆 *RADAR LOWCAP — TOP {len(resultados)}*",
-        f"📅 Timeframe: `{timeframe.upper()}` \\| Ciclo atual",
+        f"📅 Timeframe\\: `{_esc(timeframe.upper())}` \\| Ciclo atual",
         "━━━━━━━━━━━━━━━━━━━━━━━━\n",
     ]
 
@@ -126,7 +129,7 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
 
         # ── Tags ──────────────────────────────────────────────
         tags = []
-        if r["squeeze"] == "LIBERADO":  tags.append("🚨 SQUEEZE")
+        if r["squeeze"] == "LIBERADO":   tags.append("🚨 SQUEEZE")
         if r["fase_amd"] == "acumulacao": tags.append("🔒 ACUM")
         tags_str = "  ".join(tags)
 
@@ -141,6 +144,13 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
         mtf_4h = _formatar_mtf(r["mtf"].get("4h", "?"))
         mtf_1h = _formatar_mtf(r["mtf"].get("1h", "?"))
 
+        # ── Score e classe ────────────────────────────────────
+        score_esc  = _esc(str(r["score"]))
+        classe_esc = _esc(r["classe"])
+        direcao_esc = _esc(r["direcao"])
+        rsi_esc    = _esc(str(r["rsi"]))
+        vol_esc    = _esc(f"{r['vol_ratio']}x")
+
         # ── Bloco do setup de trade ───────────────────────────
         if st and st.get("valido"):
             lado      = "🟢 LONG" if st["lado"] == "long" else "🔴 SHORT"
@@ -153,35 +163,36 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
             risco_pct = _esc(f"{st['risco_pct']:.2f}%")
             sl_tipo   = _esc(st.get("sl_tipo", "estrutural"))
 
-            # Avisos opcionais (RSI alto, MTF divergente)
             avisos_txt = ""
             for aviso in st.get("avisos", []):
-                avisos_txt += f"  │ {aviso}\n"
+                avisos_txt += f"  ├ {_esc(str(aviso))}\n"
 
             trade_bloco = (
-                f"\n  ┌─ {lado} ─ R:R `1:{rr}`\n"
-                f"  │ 🎯 Entrada:     `{entrada}`\n"
-                f"  │ 🛑 SL:          `{sl}` \\({risco_pct}\\) — _{sl_tipo}_\n"
-                f"  │ 🥇 TP1 \\(30%\\): `{tp1}`\n"
-                f"  │ 🥈 TP2 \\(40%\\): `{tp2}`\n"
-                f"  │ 🥉 TP3 \\(30%\\): `{tp3}` _\\+trailing_\n"
-                + avisos_txt +
-                f"  └─ _Após TP1: SL → breakeven_\n"
+                f"\n  ┌─ {lado} ─ R\\:R `1:{rr}`\n"
+                f"  ├ 🎯 Entrada\\:      `{entrada}`\n"
+                f"  ├ 🛑 SL\\:           `{sl}` \\({risco_pct}\\) — _{sl_tipo}_\n"
+                f"  ├ 🥇 TP1 \\(30%\\)\\: `{tp1}`\n"
+                f"  ├ 🥈 TP2 \\(40%\\)\\: `{tp2}`\n"
+                f"  ├ 🥉 TP3 \\(30%\\)\\: `{tp3}` _\\+trailing_\n"
+                + (avisos_txt if avisos_txt else "")
+                + f"  └ _Após TP1\\: SL → breakeven_\n"
             )
         else:
             motivo      = _esc(st.get("motivo", "setup inválido") if st else "não calculado")
-            trade_bloco = f"\n  ⚠️ _Sem setup: {motivo}_\n"
+            trade_bloco = f"\n  ⚠️ _Sem setup\\: {motivo}_\n"
 
         # ── Bloco completo da moeda ───────────────────────────
+        symbol_esc   = _esc(r["symbol"])
+        exchange_esc = _esc(r["exchange"].upper())
+
         bloco = (
-            f"{medal} *{_esc(r['symbol'])}* "
-            f"\\({_esc(r['exchange'].upper())}\\)"
+            f"{medal} *{symbol_esc}* \\({exchange_esc}\\)"
             + (f" {tags_str}" if tags_str else "") + "\n"
             f"  💰 `{price_esc}` {c_emoji} `{change_esc}`\n"
-            f"  🎯 Score: `{r['score']}/10` — {_esc(r['classe'])}\n"
-            f"  {_esc(r['direcao'])}\n"
-            f"  📊 RSI: `{r['rsi']}` \\| Vol: `{r['vol_ratio']}x`\n"
-            f"  🕐 1D: {mtf_1d} \\| 4H: {mtf_4h} \\| 1H: {mtf_1h}"
+            f"  🎯 Score\\: `{score_esc}/10` — {classe_esc}\n"
+            f"  {direcao_esc}\n"
+            f"  📊 RSI\\: `{rsi_esc}` \\| Vol\\: `{vol_esc}`\n"
+            f"  🕐 1D\\: {mtf_1d} \\| 4H\\: {mtf_4h} \\| 1H\\: {mtf_1h}"
             f"{trade_bloco}"
         )
         linhas.append(bloco)
