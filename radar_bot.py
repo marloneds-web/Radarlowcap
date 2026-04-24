@@ -207,11 +207,19 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             antigo = utils.SCORE_MINIMO
             utils.SCORE_MINIMO = novo
             log.info(f"SCORE_MINIMO alterado: {antigo} → {novo}")
+
+            if novo <= 3:
+                dica = "⚠️ Score baixo → mais alertas, menor qualidade"
+            elif novo <= 6:
+                dica = "🎯 Boa escolha\\!"
+            else:
+                dica = "🔬 Score alto → apenas os melhores setups"
+
             await update.message.reply_text(
                 f"✅ *Score mínimo atualizado\\!*\n\n"
                 f"  Antes: `{antigo}/10`\n"
                 f"  Agora: `{novo}/10`\n\n"
-                f"{'⚠️ Score baixo → mais alertas, menor qualidade' if novo <= 3 else '🎯 Boa escolha!' if novo <= 6 else '🔬 Score alto → apenas os melhores setups'}",
+                f"{dica}",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
         except ValueError:
@@ -230,11 +238,19 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             antigo = utils.TOP_N_MOEDAS
             utils.TOP_N_MOEDAS = novo
             log.info(f"TOP_N_MOEDAS alterado: {antigo} → {novo}")
+
+            if novo >= 20:
+                dica = "📋 Lista longa → use score alto para filtrar"
+            elif novo <= 10:
+                dica = "🎯 Lista focada\\!"
+            else:
+                dica = "📊 Quantidade moderada"
+
             await update.message.reply_text(
                 f"✅ *Top moedas atualizado\\!*\n\n"
                 f"  Antes: `{antigo} moedas`\n"
                 f"  Agora: `{novo} moedas`\n\n"
-                f"{'📋 Lista longa → use score alto para filtrar' if novo >= 20 else '🎯 Lista focada!' if novo <= 10 else '📊 Quantidade moderada'}",
+                f"{dica}",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
         except ValueError:
@@ -252,17 +268,18 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             antigo = utils.POLL_INTERVAL_MINUTES
             utils.POLL_INTERVAL_MINUTES = novo
-            # Reagenda o scheduler com novo intervalo
             _reagendar(ctx.application)
             log.info(f"POLL_INTERVAL_MINUTES alterado: {antigo} → {novo}")
 
             horas = novo // 60
             minutos = novo % 60
-            tempo_fmt = (
-                f"{horas}h {minutos}min" if horas > 0 and minutos > 0
-                else f"{horas}h" if horas > 0
-                else f"{minutos}min"
-            )
+            if horas > 0 and minutos > 0:
+                tempo_fmt = f"{horas}h {minutos}min"
+            elif horas > 0:
+                tempo_fmt = f"{horas}h"
+            else:
+                tempo_fmt = f"{minutos}min"
+
             await update.message.reply_text(
                 f"✅ *Intervalo de scan atualizado\\!*\n\n"
                 f"  Antes: `{antigo} min`\n"
