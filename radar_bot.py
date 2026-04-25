@@ -67,9 +67,11 @@ def _reagendar(app: Application):
     schedule.clear("radar")
 
     def job():
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(enviar_alerta_automatico(app))
-        loop.close()
+        try:
+            # ✅ asyncio.run() gerencia o ciclo de vida do loop corretamente
+            asyncio.run(enviar_alerta_automatico(app))
+        except Exception as e:
+            log.error(f"Erro no job do scheduler: {e}")
 
     schedule.every(utils.POLL_INTERVAL_MINUTES).minutes.do(job).tag("radar")
     log.info(f"⏰ Scheduler reagendado → a cada {utils.POLL_INTERVAL_MINUTES} min")
@@ -271,7 +273,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _reagendar(ctx.application)
             log.info(f"POLL_INTERVAL_MINUTES alterado: {antigo} → {novo}")
 
-            horas = novo // 60
+            horas   = novo // 60
             minutos = novo % 60
             if horas > 0 and minutos > 0:
                 tempo_fmt = f"{horas}h {minutos}min"
@@ -444,15 +446,22 @@ async def enviar_alerta_automatico(app: Application):
             pass
 
 
+# ══════════════════════════════════════════════════════════════
+# SCHEDULER — CORRIGIDO (sem RuntimeError: Event loop is closed)
+# ══════════════════════════════════════════════════════════════
+
 def iniciar_scheduler(app: Application):
     """Inicia o scheduler em thread separada."""
     global _scheduler_app
     _scheduler_app = app
 
     def job():
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(enviar_alerta_automatico(app))
-        loop.close()
+        try:
+            # ✅ asyncio.run() cria, executa e encerra o loop de forma segura,
+            #    aguardando todas as tasks/conexões antes de fechar.
+            asyncio.run(enviar_alerta_automatico(app))
+        except Exception as e:
+            log.error(f"Erro no job do scheduler: {e}")
 
     schedule.every(utils.POLL_INTERVAL_MINUTES).minutes.do(job).tag("radar")
     log.info(f"⏰ Scheduler ativo — scan a cada {utils.POLL_INTERVAL_MINUTES} min")
@@ -495,13 +504,13 @@ def main():
     )
 
     # ── Registra handlers ─────────────────────────────────────
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("ajuda",    cmd_ajuda))
-    app.add_handler(CommandHandler("setchat",  cmd_setchat))
-    app.add_handler(CommandHandler("config",   cmd_config))
-    app.add_handler(CommandHandler("set",      cmd_set))
-    app.add_handler(CommandHandler("radar",    cmd_radar))
-    app.add_handler(CommandHandler("analise",  cmd_analise))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("ajuda",   cmd_ajuda))
+    app.add_handler(CommandHandler("setchat", cmd_setchat))
+    app.add_handler(CommandHandler("config",  cmd_config))
+    app.add_handler(CommandHandler("set",     cmd_set))
+    app.add_handler(CommandHandler("radar",   cmd_radar))
+    app.add_handler(CommandHandler("analise", cmd_analise))
 
     # ── Post-init ─────────────────────────────────────────────
     async def post_init(application: Application):
