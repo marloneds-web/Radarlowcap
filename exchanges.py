@@ -1,7 +1,15 @@
 import requests
 import pandas as pd
 import numpy as np
+import threading
+import time
+import json
+import logging
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 from utils import MIN_VOL_24H
+
+log = logging.getLogger(__name__)
 
 TIMEOUT = 10
 
@@ -186,24 +194,243 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> lis
     return list(seen.values())
 
 
-# ══════════════════════════════════════════
-# LIQUIDAÇÕES (CoinGlass público)
-# ══════════════════════════════════════════
-def obter_liquidacoes(symbol: str) -> str:
+# ══════════════════════════════════════════════════════════════
+# LIQUIDAÇÕES — SEM RESTRIÇÃO GEOGRÁFICA
+# Primário:  OKX WebSocket (global, sem auth, sem geo-block)
+# Fallback1: Bitfinex REST  (global, sem auth)
+# Fallback2: Bitget REST    (global, sem auth)
+# ══════════════════════════════════════════════════════════════
+
+# ── Cache global ───────────────────────────────────────────────
+_liq_cache: dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+_liq_lock  = threading.Lock()
+_okx_ativo = False
+
+
+# ── Normalização de símbolos ───────────────────────────────────
+def _norm_okx(symbol: str) -> str:
+    """BTCUSDT → BTC-USDT-SWAP"""
+    sym = symbol.upper().replace("-", "")
+    if sym.endswith("USDT"):
+        return f"{sym[:-4]}-USDT-SWAP"
+    if sym.endswith("USD"):
+        return f"{sym[:-3]}-USD-SWAP"
+    return sym
+
+
+def _norm_bitget(symbol: str) -> str:
+    return symbol.upper().replace("-", "")
+
+
+# ── OKX WebSocket (primário) ───────────────────────────────────
+def _iniciar_ws_okx():
+    global _okx_ativo
+    if _okx_ativo:
+        return
+    _okx_ativo = True
+
+    import websocket  # pip install websocket-client
+
+    def on_open(ws):
+        ws.send(json.dumps({
+            "op": "subscribe",
+            "args": [{"channel": "liquidation-orders", "instType": "SWAP"}]
+        }))
+        log.info("✅ OKX WS: inscrito em liquidation-orders SWAP")
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+            if "data" not in data:
+                return
+            for item in data.get("data", []):
+                inst_id = item.get("instId", "")
+                sym = inst_id.replace("-SWAP","").replace("-PERP","").replace("-","")
+                for detail in item.get("details", []):
+                    side  = detail.get("posSide", "").upper()
+                    price = float(detail.get("bkPx", 0))
+                    qty   = float(detail.get("sz",   0))
+                    usd   = price * qty
+                    if usd < 500:
+                        continue
+                    with _liq_lock:
+                        _liq_cache[sym].appendleft({
+                            "lado":  "LONG" if side == "LONG" else "SHORT",
+                            "qty":   qty,
+                            "price": price,
+                            "usd":   usd,
+                            "ts":    datetime.now(timezone.utc),
+                            "fonte": "OKX",
+                        })
+        except Exception as e:
+            log.debug(f"OKX WS parse error: {e}")
+
+    def on_error(ws, error):
+        log.warning(f"OKX WS erro: {error}")
+
+    def on_close(ws, *args):
+        global _okx_ativo
+        _okx_ativo = False
+
+    def run():
+        global _okx_ativo
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    "wss://ws.okx.com:8443/ws/v5/public",
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close,
+                )
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                log.warning(f"OKX WS exception: {e}")
+            _okx_ativo = False
+            time.sleep(5)
+            _okx_ativo = True
+
+    threading.Thread(target=run, daemon=True, name="ws-okx-liq").start()
+    log.info("🚀 OKX WebSocket de liquidações iniciado")
+
+
+# Inicia na importação do módulo
+_iniciar_ws_okx()
+
+
+# ── Bitfinex REST (fallback 1) ─────────────────────────────────
+def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
     try:
-        coin = symbol.replace("USDT","").replace("-","")
-        url  = "https://open-api.coinglass.com/public/v2/liquidation_history"
-        r    = requests.get(url, params={"symbol":coin,"interval":"h4","limit":3}, timeout=TIMEOUT)
+        url = "https://api-pub.bitfinex.com/v2/liquidations/hist"
+        r   = requests.get(url, params={"limit": limit, "sort": -1}, timeout=6)
+        r.raise_for_status()
+        eventos = []
+        for item in r.json():
+            if not isinstance(item, list) or len(item) < 6:
+                continue
+            sym_bfx = str(item[3]).upper()
+            amount  = abs(float(item[4]))
+            price   = float(item[11]) if len(item) > 11 and item[11] else float(item[5])
+            lado    = "LONG" if float(item[4]) > 0 else "SHORT"
+            usd     = amount * price
+            ts_ms   = int(item[1])
+            if usd < 500:
+                continue
+            base_req = symbol.upper().replace("USDT","").replace("USD","")
+            if base_req not in sym_bfx:
+                continue
+            eventos.append({
+                "lado":  lado,
+                "qty":   amount,
+                "price": price,
+                "usd":   usd,
+                "ts":    datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+                "fonte": "Bitfinex",
+            })
+        return eventos
+    except Exception as e:
+        log.debug(f"Bitfinex liquidações erro: {e}")
+        return []
+
+
+# ── Bitget REST (fallback 2) ───────────────────────────────────
+def _liquidacoes_bitget(symbol: str, limit: int = 20) -> list[dict]:
+    try:
+        sym = _norm_bitget(symbol)
+        url = "https://api.bitget.com/api/v2/mix/market/fills-history"
+        r   = requests.get(
+            url,
+            params={"symbol": sym, "productType": "USDT-FUTURES", "limit": limit},
+            timeout=6,
+        )
         r.raise_for_status()
         data = r.json()
-        if not data.get("success") or not data.get("data"):
-            return "Sem dados de liquidação."
-        linhas = []
-        for item in data["data"][:3]:
-            ts = pd.to_datetime(item.get("createTime",0), unit="ms")
-            linhas.append(f"  {ts.strftime('%d/%m %H:%M')} | "
-                          f"Longs: ${item.get('longLiquidationUsd',0):,.0f} | "
-                          f"Shorts: ${item.get('shortLiquidationUsd',0):,.0f}")
-        return "\n".join(linhas) or "Sem liquidações recentes."
+        if data.get("code") != "00000":
+            return []
+        eventos = []
+        for t in data.get("data", []):
+            price = float(t.get("price", 0))
+            size  = float(t.get("size",  0))
+            usd   = price * size
+            side  = t.get("side", "").upper()
+            if usd < 5000:
+                continue
+            eventos.append({
+                "lado":  "LONG" if "BUY" in side else "SHORT",
+                "qty":   size,
+                "price": price,
+                "usd":   usd,
+                "ts":    datetime.fromtimestamp(int(t.get("ts", 0)) / 1000, tz=timezone.utc),
+                "fonte": "Bitget",
+            })
+        return eventos
     except Exception as e:
-        return f"Erro liquidações: {e}"
+        log.debug(f"Bitget fills erro: {e}")
+        return []
+
+
+# ── Função principal ───────────────────────────────────────────
+def obter_liquidacoes(symbol: str, janela_minutos: int = 60) -> str:
+    """
+    Retorna texto puro (sem MarkdownV2) com resumo de liquidações.
+    Cascade: OKX WS → Bitfinex REST → Bitget REST.
+    O escape MDv2 é feito em analysis.py via _e().
+    """
+    sym   = symbol.upper().replace("-", "")
+    agora = datetime.now(timezone.utc)
+
+    # Fonte 1: cache OKX WebSocket
+    with _liq_lock:
+        cache = list(_liq_cache.get(sym, []))
+    recentes = [
+        e for e in cache
+        if (agora - e["ts"]).total_seconds() <= janela_minutos * 60
+    ]
+    fonte_usada = "OKX" if recentes else None
+
+    # Fonte 2: Bitfinex REST
+    if not recentes:
+        recentes = _liquidacoes_bitfinex(sym)
+        if recentes:
+            fonte_usada = "Bitfinex"
+
+    # Fonte 3: Bitget REST
+    if not recentes:
+        recentes = _liquidacoes_bitget(sym)
+        if recentes:
+            fonte_usada = "Bitget (proxy fills)"
+
+    if not recentes:
+        return "Sem liquidacoes significativas na ultima hora."
+
+    longs  = [e for e in recentes if e["lado"] == "LONG"]
+    shorts = [e for e in recentes if e["lado"] == "SHORT"]
+
+    total_long  = sum(e["usd"] for e in longs)
+    total_short = sum(e["usd"] for e in shorts)
+    total_geral = total_long + total_short
+
+    def fmt_usd(v: float) -> str:
+        if v >= 1_000_000: return f"${v/1_000_000:.2f}M"
+        if v >= 1_000:     return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+
+    maior = max(recentes, key=lambda e: e["usd"])
+
+    if total_long > total_short * 2:
+        sinal = "Pressao vendedora (longs forcados) — possivel continuidade de baixa"
+    elif total_short > total_long * 2:
+        sinal = "Pressao compradora (shorts forcados) — possivel short squeeze"
+    elif total_geral > 1_000_000:
+        sinal = "Volume alto de liquidacoes — volatilidade elevada"
+    else:
+        sinal = "Liquidacoes equilibradas — sem pressao dominante"
+
+    return (
+        f"Fonte: {fonte_usada} | Janela: {janela_minutos}min\n"
+        f"  Total:      {fmt_usd(total_geral)} ({len(recentes)} eventos)\n"
+        f"  Longs liq:  {fmt_usd(total_long)} ({len(longs)} ordens)\n"
+        f"  Shorts liq: {fmt_usd(total_short)} ({len(shorts)} ordens)\n"
+        f"  Maior:      {fmt_usd(maior['usd'])} @ {maior['price']:.4f} ({maior['lado']})\n"
+        f"  Sinal:      {sinal}"
+    )
