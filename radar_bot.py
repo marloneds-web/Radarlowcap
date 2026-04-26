@@ -44,11 +44,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Estado global do chat destino ─────────────────────────────
+# ── Estado global ─────────────────────────────────────────────
 chat_destino = {"id": TELEGRAM_CHAT_ID}
 
-# ── Referência global do scheduler (para reagendar) ───────────
-_scheduler_app: Application = None
+# ── Loop principal do bot (preenchido no post_init) ───────────
+_main_loop: asyncio.AbstractEventLoop = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -64,16 +64,14 @@ def _escape(text: str) -> str:
 
 def _split_msg(text: str, limit: int = 4000) -> list[str]:
     """
-    Divide a mensagem em chunks seguros para MarkdownV2.
-    Corta sempre em quebras de linha para nunca partir
-    entidades abertas como `código`, *negrito*, _itálico_.
+    Divide em chunks seguros — corta sempre em \\n
+    para nunca partir entidades abertas.
     """
     chunks = []
     while len(text) > limit:
-        # Procura o último \n antes do limite
         corte = text.rfind("\n", 0, limit)
         if corte == -1:
-            corte = limit  # fallback: corta bruto
+            corte = limit
         chunks.append(text[:corte])
         text = text[corte:].lstrip("\n")
     if text:
@@ -82,12 +80,20 @@ def _split_msg(text: str, limit: int = 4000) -> list[str]:
 
 
 def _reagendar(app: Application):
-    """Limpa e recria o job do scheduler com o intervalo atual."""
+    """Recria o job do scheduler com o intervalo atual."""
     schedule.clear("radar")
 
     def job():
+        if _main_loop is None or _main_loop.is_closed():
+            log.error("❌ Loop principal não disponível para o scheduler.")
+            return
+        # ✅ Submete a coroutine no loop do bot — sem criar novo loop
+        future = asyncio.run_coroutine_threadsafe(
+            enviar_alerta_automatico(app),
+            _main_loop,
+        )
         try:
-            asyncio.run(enviar_alerta_automatico(app))
+            future.result(timeout=300)  # aguarda até 5 min
         except Exception as e:
             log.error(f"Erro no job do scheduler: {e}")
 
@@ -167,22 +173,12 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════
-# COMANDO /set — AJUSTE EM TEMPO REAL
+# COMANDO /set
 # ══════════════════════════════════════════════════════════════
 
 async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Ajusta configurações em tempo real via Telegram.
-
-    Uso:
-      /set score 7
-      /set moedas 20
-      /set intervalo 60
-      /set timeframe 1h
-    """
     args = ctx.args
 
-    # Sem argumentos → mostra menu de ajuda
     if not args:
         msg = (
             "⚙️ *AJUSTAR CONFIGURAÇÃO*\n"
@@ -226,20 +222,16 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             antigo = utils.SCORE_MINIMO
             utils.SCORE_MINIMO = novo
-            log.info(f"SCORE_MINIMO alterado: {antigo} → {novo}")
-
-            if novo <= 3:
-                dica = "⚠️ Score baixo → mais alertas, menor qualidade"
-            elif novo <= 6:
-                dica = "🎯 Boa escolha\\!"
-            else:
-                dica = "🔬 Score alto → apenas os melhores setups"
-
+            log.info(f"SCORE_MINIMO: {antigo} → {novo}")
+            dica = (
+                "⚠️ Score baixo → mais alertas, menor qualidade" if novo <= 3
+                else "🎯 Boa escolha\\!" if novo <= 6
+                else "🔬 Score alto → apenas os melhores setups"
+            )
             await update.message.reply_text(
                 f"✅ *Score mínimo atualizado\\!*\n\n"
                 f"  Antes: `{antigo}/10`\n"
-                f"  Agora: `{novo}/10`\n\n"
-                f"{dica}",
+                f"  Agora: `{novo}/10`\n\n{dica}",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
         except ValueError:
@@ -257,20 +249,16 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             antigo = utils.TOP_N_MOEDAS
             utils.TOP_N_MOEDAS = novo
-            log.info(f"TOP_N_MOEDAS alterado: {antigo} → {novo}")
-
-            if novo >= 20:
-                dica = "📋 Lista longa → use score alto para filtrar"
-            elif novo <= 10:
-                dica = "🎯 Lista focada\\!"
-            else:
-                dica = "📊 Quantidade moderada"
-
+            log.info(f"TOP_N_MOEDAS: {antigo} → {novo}")
+            dica = (
+                "📋 Lista longa → use score alto para filtrar" if novo >= 20
+                else "🎯 Lista focada\\!" if novo <= 10
+                else "📊 Quantidade moderada"
+            )
             await update.message.reply_text(
                 f"✅ *Top moedas atualizado\\!*\n\n"
                 f"  Antes: `{antigo} moedas`\n"
-                f"  Agora: `{novo} moedas`\n\n"
-                f"{dica}",
+                f"  Agora: `{novo} moedas`\n\n{dica}",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
         except ValueError:
@@ -289,17 +277,14 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             antigo = utils.POLL_INTERVAL_MINUTES
             utils.POLL_INTERVAL_MINUTES = novo
             _reagendar(ctx.application)
-            log.info(f"POLL_INTERVAL_MINUTES alterado: {antigo} → {novo}")
-
-            horas   = novo // 60
-            minutos = novo % 60
+            log.info(f"POLL_INTERVAL_MINUTES: {antigo} → {novo}")
+            horas, minutos = divmod(novo, 60)
             if horas > 0 and minutos > 0:
                 tempo_fmt = f"{horas}h {minutos}min"
             elif horas > 0:
                 tempo_fmt = f"{horas}h"
             else:
                 tempo_fmt = f"{minutos}min"
-
             await update.message.reply_text(
                 f"✅ *Intervalo de scan atualizado\\!*\n\n"
                 f"  Antes: `{antigo} min`\n"
@@ -320,16 +305,14 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if valor_raw not in tfs_validos:
             tfs_str = " \\| ".join(f"`{t}`" for t in tfs_validos)
             await update.message.reply_text(
-                f"❌ Timeframe inválido\\.\n\n"
-                f"Opções válidas: {tfs_str}\n\n"
+                f"❌ Timeframe inválido\\.\n\nOpções válidas: {tfs_str}\n\n"
                 f"Exemplo: `/set timeframe 4h`",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
             return
         antigo = utils.TIMEFRAME_PADRAO
         utils.TIMEFRAME_PADRAO = valor_raw
-        log.info(f"TIMEFRAME_PADRAO alterado: {antigo} → {valor_raw}")
-
+        log.info(f"TIMEFRAME_PADRAO: {antigo} → {valor_raw}")
         dicas = {
             "1m":  "⚡ Scalping — muito ruído, use com cuidado",
             "5m":  "⚡ Scalping curto",
@@ -347,7 +330,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
-    # ── parâmetro desconhecido ─────────────────────────────────
+    # ── desconhecido ──────────────────────────────────────────
     else:
         await update.message.reply_text(
             f"❌ Parâmetro `{_escape(parametro)}` desconhecido\\.\n\n"
@@ -465,19 +448,23 @@ async def enviar_alerta_automatico(app: Application):
 
 
 # ══════════════════════════════════════════════════════════════
-# SCHEDULER — CORRIGIDO (sem RuntimeError: Event loop is closed)
+# SCHEDULER — USA O LOOP DO BOT, SEM CRIAR NOVO
 # ══════════════════════════════════════════════════════════════
 
 def iniciar_scheduler(app: Application):
     """Inicia o scheduler em thread separada."""
-    global _scheduler_app
-    _scheduler_app = app
 
     def job():
+        if _main_loop is None or _main_loop.is_closed():
+            log.error("❌ Loop principal fechado — scheduler abortou.")
+            return
+        # ✅ run_coroutine_threadsafe injeta a coroutine no loop do bot
+        future = asyncio.run_coroutine_threadsafe(
+            enviar_alerta_automatico(app),
+            _main_loop,
+        )
         try:
-            # ✅ asyncio.run() cria, executa e encerra o loop de forma segura,
-            #    aguardando todas as tasks/conexões antes de fechar.
-            asyncio.run(enviar_alerta_automatico(app))
+            future.result(timeout=300)  # aguarda até 5 min
         except Exception as e:
             log.error(f"Erro no job do scheduler: {e}")
 
@@ -498,22 +485,15 @@ def iniciar_scheduler(app: Application):
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    global _main_loop
+
     if not TOKEN_OK:
         print("=" * 55)
         print("❌  TELEGRAM_BOT_TOKEN não configurado!")
         print("=" * 55)
-        print("→ No DISCLOUD:")
-        print("  Dashboard → sua app → Envs → adicionar:")
-        print("  TELEGRAM_BOT_TOKEN = seu_token_aqui")
-        print("  TELEGRAM_CHAT_ID   = seu_chat_id_aqui")
-        print("=" * 55)
         raise SystemExit(1)
 
     log.info("🚀 Iniciando Radar Lowcap Bot...")
-    log.info(f"⏰ Intervalo:    {utils.POLL_INTERVAL_MINUTES} min")
-    log.info(f"📊 Score mínimo: {utils.SCORE_MINIMO}")
-    log.info(f"🏆 Top moedas:   {utils.TOP_N_MOEDAS}")
-    log.info(f"⏱️ Timeframe:    {utils.TIMEFRAME_PADRAO}")
 
     app = (
         Application.builder()
@@ -530,8 +510,13 @@ def main():
     app.add_handler(CommandHandler("radar",   cmd_radar))
     app.add_handler(CommandHandler("analise", cmd_analise))
 
-    # ── Post-init ─────────────────────────────────────────────
+    # ── Post-init: captura o loop ANTES do scheduler ──────────
     async def post_init(application: Application):
+        global _main_loop
+        # ✅ Captura o loop que o python-telegram-bot está usando
+        _main_loop = asyncio.get_running_loop()
+        log.info(f"✅ Loop principal capturado: {_main_loop}")
+
         await application.bot.set_my_commands([
             BotCommand("start",   "Apresentação do bot"),
             BotCommand("radar",   "Scan manual agora"),
@@ -541,6 +526,7 @@ def main():
             BotCommand("setchat", "Definir chat para alertas"),
             BotCommand("ajuda",   "Lista de comandos"),
         ])
+
         iniciar_scheduler(application)
         log.info("✅ Bot iniciado com sucesso!")
 
