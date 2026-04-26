@@ -11,6 +11,17 @@ from utils import MIN_VOL_24H
 
 log = logging.getLogger(__name__)
 
+# ── Importação segura do websocket-client ─────────────────────
+try:
+    import websocket
+    _WEBSOCKET_DISPONIVEL = True
+except ImportError:
+    _WEBSOCKET_DISPONIVEL = False
+    log.warning(
+        "⚠️ websocket-client não instalado. "
+        "Liquidações OKX desativadas. Execute: pip install websocket-client"
+    )
+
 TIMEOUT = 10
 
 TIMEFRAME_MAP = {
@@ -225,11 +236,15 @@ def _norm_bitget(symbol: str) -> str:
 # ── OKX WebSocket (primário) ───────────────────────────────────
 def _iniciar_ws_okx():
     global _okx_ativo
+
+    # Aborta silenciosamente se websocket-client não estiver instalado
+    if not _WEBSOCKET_DISPONIVEL:
+        log.warning("OKX WS ignorado: websocket-client ausente. Usando apenas REST fallbacks.")
+        return
+
     if _okx_ativo:
         return
     _okx_ativo = True
-
-    import websocket  # pip install websocket-client
 
     def on_open(ws):
         ws.send(json.dumps({
@@ -372,7 +387,7 @@ def _liquidacoes_bitget(symbol: str, limit: int = 20) -> list[dict]:
 # ── Função principal ───────────────────────────────────────────
 def obter_liquidacoes(symbol: str, janela_minutos: int = 60) -> str:
     """
-    Retorna texto puro (sem MarkdownV2) com resumo de liquidações.
+    Retorna texto puro com resumo de liquidações.
     Cascade: OKX WS → Bitfinex REST → Bitget REST.
     O escape MDv2 é feito em analysis.py via _e().
     """
