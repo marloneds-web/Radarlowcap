@@ -206,21 +206,15 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> lis
 
 
 # ══════════════════════════════════════════════════════════════
-# LIQUIDAÇÕES — SEM RESTRIÇÃO GEOGRÁFICA
-# Primário:  OKX WebSocket (global, sem auth, sem geo-block)
-# Fallback1: Bitfinex REST  (global, sem auth)
-# Fallback2: Bitget REST    (global, sem auth)
+# LIQUIDAÇÕES
 # ══════════════════════════════════════════════════════════════
 
-# ── Cache global ───────────────────────────────────────────────
 _liq_cache: dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
 _liq_lock  = threading.Lock()
 _okx_ativo = False
 
 
-# ── Normalização de símbolos ───────────────────────────────────
 def _norm_okx(symbol: str) -> str:
-    """BTCUSDT → BTC-USDT-SWAP"""
     sym = symbol.upper().replace("-", "")
     if sym.endswith("USDT"):
         return f"{sym[:-4]}-USDT-SWAP"
@@ -233,11 +227,10 @@ def _norm_bitget(symbol: str) -> str:
     return symbol.upper().replace("-", "")
 
 
-# ── OKX WebSocket (primário) ───────────────────────────────────
+# ── OKX WebSocket ──────────────────────────────────────────────
 def _iniciar_ws_okx():
     global _okx_ativo
 
-    # Aborta silenciosamente se websocket-client não estiver instalado
     if not _WEBSOCKET_DISPONIVEL:
         log.warning("OKX WS ignorado: websocket-client ausente. Usando apenas REST fallbacks.")
         return
@@ -309,11 +302,10 @@ def _iniciar_ws_okx():
     log.info("🚀 OKX WebSocket de liquidações iniciado")
 
 
-# Inicia na importação do módulo
 _iniciar_ws_okx()
 
 
-# ── Bitfinex REST (fallback 1) ─────────────────────────────────
+# ── Bitfinex REST ──────────────────────────────────────────────
 def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
     try:
         url = "https://api-pub.bitfinex.com/v2/liquidations/hist"
@@ -348,7 +340,7 @@ def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
         return []
 
 
-# ── Bitget REST (fallback 2) ───────────────────────────────────
+# ── Bitget REST ────────────────────────────────────────────────
 def _liquidacoes_bitget(symbol: str, limit: int = 20) -> list[dict]:
     try:
         sym = _norm_bitget(symbol)
@@ -386,15 +378,9 @@ def _liquidacoes_bitget(symbol: str, limit: int = 20) -> list[dict]:
 
 # ── Função principal ───────────────────────────────────────────
 def obter_liquidacoes(symbol: str, janela_minutos: int = 60) -> str:
-    """
-    Retorna texto puro com resumo de liquidações.
-    Cascade: OKX WS → Bitfinex REST → Bitget REST.
-    O escape MDv2 é feito em analysis.py via _e().
-    """
     sym   = symbol.upper().replace("-", "")
     agora = datetime.now(timezone.utc)
 
-    # Fonte 1: cache OKX WebSocket
     with _liq_lock:
         cache = list(_liq_cache.get(sym, []))
     recentes = [
@@ -403,13 +389,11 @@ def obter_liquidacoes(symbol: str, janela_minutos: int = 60) -> str:
     ]
     fonte_usada = "OKX" if recentes else None
 
-    # Fonte 2: Bitfinex REST
     if not recentes:
         recentes = _liquidacoes_bitfinex(sym)
         if recentes:
             fonte_usada = "Bitfinex"
 
-    # Fonte 3: Bitget REST
     if not recentes:
         recentes = _liquidacoes_bitget(sym)
         if recentes:
