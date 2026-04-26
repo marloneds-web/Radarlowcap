@@ -62,13 +62,31 @@ def _escape(text: str) -> str:
     return text
 
 
+def _split_msg(text: str, limit: int = 4000) -> list[str]:
+    """
+    Divide a mensagem em chunks seguros para MarkdownV2.
+    Corta sempre em quebras de linha para nunca partir
+    entidades abertas como `código`, *negrito*, _itálico_.
+    """
+    chunks = []
+    while len(text) > limit:
+        # Procura o último \n antes do limite
+        corte = text.rfind("\n", 0, limit)
+        if corte == -1:
+            corte = limit  # fallback: corta bruto
+        chunks.append(text[:corte])
+        text = text[corte:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 def _reagendar(app: Application):
     """Limpa e recria o job do scheduler com o intervalo atual."""
     schedule.clear("radar")
 
     def job():
         try:
-            # ✅ asyncio.run() gerencia o ciclo de vida do loop corretamente
             asyncio.run(enviar_alerta_automatico(app))
         except Exception as e:
             log.error(f"Erro no job do scheduler: {e}")
@@ -357,9 +375,9 @@ async def cmd_radar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             score_minimo=utils.SCORE_MINIMO,
         )
         msg = formatar_ranking(resultados, utils.TIMEFRAME_PADRAO)
-        for i in range(0, len(msg), 4000):
+        for chunk in _split_msg(msg):
             await update.message.reply_text(
-                msg[i:i+4000],
+                chunk,
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
     except Exception as e:
@@ -392,9 +410,9 @@ async def cmd_analise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     try:
         relatorio = gerar_relatorio_completo(par, timeframe)
-        for i in range(0, len(relatorio), 4000):
+        for chunk in _split_msg(relatorio):
             await update.message.reply_text(
-                relatorio[i:i+4000],
+                chunk,
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
     except Exception as e:
@@ -427,10 +445,10 @@ async def enviar_alerta_automatico(app: Application):
             score_minimo=utils.SCORE_MINIMO,
         )
         msg = formatar_ranking(resultados, utils.TIMEFRAME_PADRAO)
-        for i in range(0, len(msg), 4000):
+        for chunk in _split_msg(msg):
             await app.bot.send_message(
                 chat_id=cid,
-                text=msg[i:i+4000],
+                text=chunk,
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
         log.info(f"✅ Alerta enviado para {cid} ({len(resultados)} moedas)")
