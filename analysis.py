@@ -5,6 +5,55 @@ from exchanges import obter_candles
 
 
 # ══════════════════════════════════════════════════════════════
+# HELPERS DE ESCAPE — MarkdownV2
+# ══════════════════════════════════════════════════════════════
+
+def _e(text) -> str:
+    """Escapa TODOS os caracteres reservados do MarkdownV2."""
+    text = str(text)
+    for ch in r"\_*[]()~`>#+-=|{}.!:":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+def _c(text) -> str:
+    """Envolve em bloco de código inline (não precisa escapar dentro)."""
+    return f"`{text}`"
+
+
+def _b(text) -> str:
+    """Negrito seguro."""
+    return f"*{_e(str(text))}*"
+
+
+def _i(text) -> str:
+    """
+    Itálico seguro — escapa tudo EXCETO underscore,
+    que é o delimitador do itálico no MarkdownV2.
+    """
+    inner = str(text)
+    for ch in r"\*[]()~`>#+-=|{}.!:":
+        inner = inner.replace(ch, f"\\{ch}")
+    return f"_{inner}_"
+
+
+def _safe(text) -> str:
+    """
+    Remove delimitadores de entidade para textos dinâmicos curtos.
+    Substitui _ por espaço, remove * ` ~ [ ].
+    """
+    return (
+        str(text)
+        .replace("_", " ")
+        .replace("*", "")
+        .replace("`", "")
+        .replace("~", "")
+        .replace("[", "")
+        .replace("]", "")
+    )
+
+
+# ══════════════════════════════════════════════════════════════
 # FIBONACCI
 # ══════════════════════════════════════════════════════════════
 
@@ -37,7 +86,6 @@ def calcular_fibonacci(df: pd.DataFrame, janela: int = 50):
 # ══════════════════════════════════════════════════════════════
 
 def _swing_points(df: pd.DataFrame, janela: int = 5):
-    """Detecta topos e fundos de swing."""
     highs = df["high"].values
     lows  = df["low"].values
     n     = len(highs)
@@ -62,11 +110,6 @@ def _swing_points(df: pd.DataFrame, janela: int = 5):
 # ══════════════════════════════════════════════════════════════
 
 def _detectar_fvg(df: pd.DataFrame, lado: str = "long") -> list:
-    """
-    Detecta Fair Value Gaps recentes.
-    Long  FVG: low[i] > high[i-2]
-    Short FVG: high[i] < low[i-2]
-    """
     fvgs = []
     for i in range(2, len(df)):
         if lado == "long":
@@ -96,7 +139,7 @@ def avaliar_tendencia(df: pd.DataFrame):
         ("Topos e fundos ascendentes",
          df["high"].tail(20).iloc[-1] > df["high"].tail(20).iloc[0]
          and df["low"].tail(20).iloc[-1] > df["low"].tail(20).iloc[0]),
-        ("Preço acima da EMA21",  preco > ema21.iloc[-1]),
+        ("Preco acima da EMA21",  preco > ema21.iloc[-1]),
         ("EMA21 ascendente",      ema21.iloc[-1] > ema21.iloc[-5]),
         ("EMA9 acima da EMA21",   ema9.iloc[-1]  > ema21.iloc[-1]),
         ("EMA21 acima da EMA50",  ema21.iloc[-1] > ema50.iloc[-1]),
@@ -104,6 +147,7 @@ def avaliar_tendencia(df: pd.DataFrame):
     score   = sum(1 for _, ok in criterios if ok)
     direcao = (f"📈 ALTA ({score}/5)" if score >= 3
                else f"📉 BAIXA ({5 - score}/5)")
+    # ✅ detalhes sem MarkdownV2 — será inserido como texto plano no relatório
     detalhes = "\n".join(
         f"  {'✅' if ok else '❌'} {nome}" for nome, ok in criterios
     )
@@ -128,20 +172,10 @@ def analise_multi_timeframe(par: str, timeframes: tuple = ("1d", "4h", "1h")):
 
 
 # ══════════════════════════════════════════════════════════════
-# SETUP DE TRADE: ENTRADA / SL / TP
+# SETUP DE TRADE
 # ══════════════════════════════════════════════════════════════
 
 def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> dict:
-    """
-    Calcula entrada, SL e TPs baseado em estrutura de mercado.
-
-    Filosofia do SL:
-    ─────────────────────────────────────────────────────────
-    • SL fica ABAIXO do swing low (long) ou ACIMA do swing high (short)
-    • Buffer = 0.3x ATR  — só pra não pegar o pavio exato
-    • Mínimo = 0.5x ATR  — só se o swing estiver colado no preço
-    • Quem define o SL é o SWING, não o ATR
-    """
     try:
         preco = df["close"].iloc[-1]
         atr   = ta.volatility.AverageTrueRange(
@@ -152,71 +186,48 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
         swing_highs, swing_lows = _swing_points(df, janela=5)
         lado = "long" if "ALTA" in direcao else "short"
 
-        # ── Filtro 1: RSI extremo ──────────────────────────────
         if lado == "long" and rsi > 70:
-            return {
-                "valido": False,
-                "motivo": f"RSI sobrecomprado ({rsi:.1f}) — risco de topo",
-            }
+            return {"valido": False, "motivo": f"RSI sobrecomprado ({rsi:.1f})"}
         if lado == "short" and rsi < 30:
-            return {
-                "valido": False,
-                "motivo": f"RSI sobrevendido ({rsi:.1f}) — risco de fundo",
-            }
+            return {"valido": False, "motivo": f"RSI sobrevendido ({rsi:.1f})"}
 
-        # ── Filtro 2: Preço próximo ao topo/fundo estrutural ──
         if swing_highs and lado == "long":
             ultimo_topo   = swing_highs[-1][1]
             dist_topo_pct = ((ultimo_topo - preco) / preco) * 100
             if dist_topo_pct < 1.5:
-                return {
-                    "valido": False,
-                    "motivo": f"Preço próximo ao topo ({dist_topo_pct:.1f}% de distância)",
-                }
+                return {"valido": False,
+                        "motivo": f"Preco proximo ao topo ({dist_topo_pct:.1f}%)"}
 
         if swing_lows and lado == "short":
             ultimo_fundo   = swing_lows[-1][1]
             dist_fundo_pct = ((preco - ultimo_fundo) / preco) * 100
             if dist_fundo_pct < 1.5:
-                return {
-                    "valido": False,
-                    "motivo": f"Preço próximo ao fundo ({dist_fundo_pct:.1f}% de distância)",
-                }
+                return {"valido": False,
+                        "motivo": f"Preco proximo ao fundo ({dist_fundo_pct:.1f}%)"}
 
-        # ── Filtro 3: Confluência MTF ──────────────────────────
         aviso_mtf = ""
         if mtf:
             tf_1h = str(mtf.get("1h", ""))
             tf_4h = str(mtf.get("4h", ""))
             if lado == "long":
                 if "BAIXA" in tf_1h and "BAIXA" in tf_4h:
-                    return {
-                        "valido": False,
-                        "motivo": "1H e 4H em BAIXA — sem confluência",
-                    }
+                    return {"valido": False, "motivo": "1H e 4H em BAIXA sem confluencia"}
                 if "BAIXA" in tf_1h:
-                    aviso_mtf = "⚠️ 1H em baixa — aguardar pullback"
+                    aviso_mtf = "1H em baixa — aguardar pullback"
             else:
                 if "ALTA" in tf_1h and "ALTA" in tf_4h:
-                    return {
-                        "valido": False,
-                        "motivo": "1H e 4H em ALTA — sem confluência",
-                    }
+                    return {"valido": False, "motivo": "1H e 4H em ALTA sem confluencia"}
                 if "ALTA" in tf_1h:
-                    aviso_mtf = "⚠️ 1H em alta — aguardar pullback"
+                    aviso_mtf = "1H em alta — aguardar pullback"
 
         if lado == "long":
-            # ── LONG ──────────────────────────────────────────
             if len(swing_lows) < 2:
                 return {"valido": False, "motivo": "swings insuficientes"}
 
             ultimo_fundo = swing_lows[-1][1]
+            sl_raw       = ultimo_fundo - (atr * 0.3)
+            risco_abs    = preco - sl_raw
 
-            # SL: swing low - buffer 0.3x ATR
-            sl_raw    = ultimo_fundo - (atr * 0.3)
-            risco_abs = preco - sl_raw
-
-            # Mínimo de 0.5x ATR (evita stop colado)
             if risco_abs < atr * 0.5:
                 sl_raw    = preco - (atr * 0.5)
                 risco_abs = preco - sl_raw
@@ -226,16 +237,14 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
             if risco_pct > 8:
                 return {"valido": False, "motivo": f"SL muito distante ({risco_pct:.1f}%)"}
             if risco_abs <= 0:
-                return {"valido": False, "motivo": "SL inválido"}
+                return {"valido": False, "motivo": "SL invalido"}
 
             entrada = preco
 
-            # TP1 → topo de swing mais próximo acima
             topos_acima = sorted([h for _, h in swing_highs if h > preco])
             tp1 = round(topos_acima[0], 8) if topos_acima \
                   else round(preco + risco_abs * 2.0, 8)
 
-            # TP2 → FVG bullish ou Fibonacci 127.2%
             fvgs      = _detectar_fvg(df, lado="long")
             fvg_acima = sorted([f for f in fvgs if f > tp1])
             if fvg_acima:
@@ -246,7 +255,6 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
                 tp2 = round(tp2_fib, 8) if tp2_fib > tp1 \
                       else round(tp1 + risco_abs * 1.5, 8)
 
-            # TP3 → maior topo estrutural acima do TP2
             topos_grandes = sorted([h for _, h in swing_highs if h > tp2])
             tp3 = round(topos_grandes[-1], 8) if topos_grandes \
                   else round(tp2 + risco_abs * 2.0, 8)
@@ -254,17 +262,13 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
             rr = round((tp2 - entrada) / risco_abs, 2)
 
         else:
-            # ── SHORT ─────────────────────────────────────────
             if len(swing_highs) < 2:
                 return {"valido": False, "motivo": "swings insuficientes"}
 
             ultimo_topo = swing_highs[-1][1]
+            sl_raw      = ultimo_topo + (atr * 0.3)
+            risco_abs   = sl_raw - preco
 
-            # SL: swing high + buffer 0.3x ATR
-            sl_raw    = ultimo_topo + (atr * 0.3)
-            risco_abs = sl_raw - preco
-
-            # Mínimo de 0.5x ATR
             if risco_abs < atr * 0.5:
                 sl_raw    = preco + (atr * 0.5)
                 risco_abs = sl_raw - preco
@@ -274,16 +278,14 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
             if risco_pct > 8:
                 return {"valido": False, "motivo": f"SL muito distante ({risco_pct:.1f}%)"}
             if risco_abs <= 0:
-                return {"valido": False, "motivo": "SL inválido"}
+                return {"valido": False, "motivo": "SL invalido"}
 
             entrada = preco
 
-            # TP1 → fundo de swing mais próximo abaixo
             fundos_abaixo = sorted([l for _, l in swing_lows if l < preco], reverse=True)
             tp1 = round(fundos_abaixo[0], 8) if fundos_abaixo \
                   else round(preco - risco_abs * 2.0, 8)
 
-            # TP2 → FVG bearish ou Fibonacci 61.8%
             fvgs       = _detectar_fvg(df, lado="short")
             fvg_abaixo = sorted([f for f in fvgs if f < tp1], reverse=True)
             if fvg_abaixo:
@@ -294,26 +296,20 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
                 tp2 = round(tp2_fib, 8) if 0 < tp2_fib < tp1 \
                       else round(tp1 - risco_abs * 1.5, 8)
 
-            # TP3 → menor fundo estrutural abaixo do TP2
             fundos_grandes = sorted([l for _, l in swing_lows if l < tp2])
             tp3 = round(fundos_grandes[0], 8) if fundos_grandes \
                   else round(tp2 - risco_abs * 2.0, 8)
 
             rr = round((entrada - tp2) / risco_abs, 2)
 
-        # ── Filtro final: R:R mínimo 2:1 ──────────────────────
         if rr < 2.0:
-            return {
-                "valido": False,
-                "motivo": f"R:R insuficiente (1:{rr})",
-            }
+            return {"valido": False, "motivo": f"RR insuficiente (1:{rr})"}
 
-        # ── Avisos (não invalidam, só alertam) ────────────────
         avisos = []
         if lado == "long"  and rsi > 60:
-            avisos.append(f"⚠️ RSI elevado ({rsi:.1f}) — entrada em força")
+            avisos.append(f"RSI elevado ({rsi:.1f}) — entrada em forca")
         if lado == "short" and rsi < 40:
-            avisos.append(f"⚠️ RSI baixo ({rsi:.1f}) — entrada em fraqueza")
+            avisos.append(f"RSI baixo ({rsi:.1f}) — entrada em fraqueza")
         if aviso_mtf:
             avisos.append(aviso_mtf)
 
@@ -334,12 +330,12 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
             "avisos":    avisos,
         }
 
-    except Exception as e:
-        return {"valido": False, "motivo": str(e)[:40]}
+    except Exception as ex:
+        return {"valido": False, "motivo": str(ex)[:40]}
 
 
 # ══════════════════════════════════════════════════════════════
-# RELATÓRIO COMPLETO (comando /analisar)
+# RELATÓRIO COMPLETO — 100% MarkdownV2 seguro
 # ══════════════════════════════════════════════════════════════
 
 def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str:
@@ -376,73 +372,143 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
 
     st = calcular_setup_trade(df, direcao, mtf=mtf)
 
+    # ── Helpers locais de formatação numérica ─────────────────
+    def _fp(v) -> str:
+        """Formata float como código inline — sem escape interno."""
+        f = float(v)
+        if f < 0.0001:   s = f"{f:.8f}"
+        elif f < 1:      s = f"{f:.6f}"
+        elif f < 1000:   s = f"{f:.4f}"
+        else:            s = f"{f:,.2f}"
+        return f"`{s}`"
+
+    def _fn(v, decimais=2) -> str:
+        """Float simples escapado."""
+        return _e(f"{float(v):.{decimais}f}")
+
+    # ── Bloco de setup ────────────────────────────────────────
     if st.get("valido"):
         lado_label = "🟢 LONG" if st["lado"] == "long" else "🔴 SHORT"
-        avisos_txt = "\n".join(f"  {a}" for a in st.get("avisos", []))
-        setup_txt  = (
-            f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📐 *SETUP:* {lado_label} | R:R `1:{st['rr']}`\n\n"
-            f"  🎯 Entrada:     `{st['entrada']}`\n"
-            f"  🛑 SL:          `{st['sl']}` ({st['risco_pct']}%) — {st['sl_tipo']}\n"
-            f"  🥇 TP1 (30%):   `{st['tp1']}`\n"
-            f"  🥈 TP2 (40%):   `{st['tp2']}`\n"
-            f"  🥉 TP3 (30%):   `{st['tp3']}` + trailing\n"
-            f"  📏 ATR(14):     `{st['atr']}`\n"
-            + (f"\n{avisos_txt}\n" if avisos_txt else "")
-            + f"  💡 _Após TP1: mover SL para entrada (breakeven)_"
-        )
-    else:
+        rr_esc     = _e(str(st["rr"]))
+        risco_esc  = _e(f"{st['risco_pct']}%")
+        sl_tipo_e  = _e(_safe(st["sl_tipo"]))
+
+        avisos_linhas = ""
+        for av in st.get("avisos", []):
+            avisos_linhas += f"  ⚠️ {_e(_safe(str(av)))}\n"
+
         setup_txt = (
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ *SETUP:* _{st.get('motivo', 'não identificado')}_"
+            f"📐 *SETUP:* {lado_label} \\| R\\:R `1:{rr_esc}`\n\n"
+            f"  🎯 Entrada\\:   {_fp(st['entrada'])}\n"
+            f"  🛑 SL\\:        {_fp(st['sl'])} \\({risco_esc}\\) \\— {sl_tipo_e}\n"
+            f"  🥇 TP1 \\(30%\\)\\: {_fp(st['tp1'])}\n"
+            f"  🥈 TP2 \\(40%\\)\\: {_fp(st['tp2'])}\n"
+            f"  🥉 TP3 \\(30%\\)\\: {_fp(st['tp3'])} \\+trailing\n"
+            f"  📏 ATR\\(14\\)\\:  {_fp(st['atr'])}\n"
+            + (f"\n{avisos_linhas}" if avisos_linhas else "")
+            + f"  💡 Apos TP1\\: mover SL para entrada \\(breakeven\\)\n"
+        )
+    else:
+        motivo_e  = _e(_safe(st.get("motivo", "nao identificado")))
+        setup_txt = (
+            f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ *SETUP:* {motivo_e}\n"
         )
 
-    score_emoji = "🔥" if score >= 8 else "⚡" if score >= 6 else "📊" if score >= 4 else "❄️"
+    score_emoji = (
+        "🔥" if score >= 8 else
+        "⚡" if score >= 6 else
+        "📊" if score >= 4 else
+        "❄️"
+    )
+
+    # ── MTF — cada valor já sai de avaliar_tendencia() sem MDv2 ──
+    mtf_1d = _e(_safe(mtf.get("1d", "N/A")))
+    mtf_4h = _e(_safe(mtf.get("4h", "N/A")))
+    mtf_1h = _e(_safe(mtf.get("1h", "N/A")))
+
+    # ── Squeeze ────────────────────────────────────────────────
+    sq_emoji = sq.get("emoji", "")
+    sq_msg   = _e(_safe(sq.get("msg", "")))
+    sq_mom   = _e(_safe(str(sq.get("momentum", ""))))
+    sq_seta  = "↑" if sq.get("crescendo") else "↓"
+
+    # ── Breakdown (lista de strings vindas de strategy.py) ─────
+    # Cada item pode conter MarkdownV2 já formatado ou texto puro.
+    # Passamos por _safe + _e para garantir que não vai vazar.
+    breakdown_txt = "\n".join(_e(_safe(str(b))) for b in breakdown)
+
+    # ── Critérios de tendência — texto puro, só escapa ─────────
+    crit_det_esc = _e(_safe(crit_det))
+
+    # ── Fibonacci ──────────────────────────────────────────────
+    fib_linhas = "\n".join(
+        f"  {_e(k)}\\: {_fp(v)}" for k, v in fib_ret.items()
+    )
+
+    # ── Liquidações ────────────────────────────────────────────
+    liq_esc = _e(_safe(str(liquidacoes)))
+
+    # ── Classe / descrição ─────────────────────────────────────
+    classe_e      = _e(_safe(classe))
+    classe_desc_e = _e(_safe(classe_desc))
+    direcao_e     = _e(_safe(direcao))
+    vol_forca_e   = _e(_safe(vol_forca))
 
     relatorio = (
-        f"╔══════════════════════════════════════════╗\n"
-        f"   📊 *{par}* | {timeframe.upper()}\n"
-        f"╚══════════════════════════════════════════╝\n\n"
-        f"{score_emoji} *SCORE: {score}/10* — {classe}\n"
-        f"_{classe_desc}_\n\n"
-        + "\n".join(breakdown) +
-        f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📐 *TENDÊNCIA:* {direcao}\n"
-        f"{crit_det}\n\n"
+        f"📊 *{_e(par)}* \\| `{_e(timeframe.upper())}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"{score_emoji} *SCORE\\: {_e(str(score))}/10* \\— {classe_e}\n"
+        f"{classe_desc_e}\n\n"
+        f"{breakdown_txt}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 *MULTI-TIMEFRAME:*\n"
-        f"  1D → {mtf.get('1d', 'N/A')}\n"
-        f"  4H → {mtf.get('4h', 'N/A')}\n"
-        f"  1H → {mtf.get('1h', 'N/A')}\n\n"
+        f"📐 *TENDENCIA\\:* {direcao_e}\n"
+        f"{crit_det_esc}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 *SQUEEZE:* {sq['emoji']} {sq['msg']}\n"
-        f"  Momentum: {sq['momentum']} {'↑' if sq['crescendo'] else '↓'}\n\n"
+        f"🕐 *MULTI\\-TIMEFRAME\\:*\n"
+        f"  1D \\→ {mtf_1d}\n"
+        f"  4H \\→ {mtf_4h}\n"
+        f"  1H \\→ {mtf_1h}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *MÉDIAS MÓVEIS:*\n"
-        f"  EMA 9   → {df['EMA_9'].iloc[-1]:.6f}\n"
-        f"  EMA 21  → {df['EMA_21'].iloc[-1]:.6f}\n"
-        f"  EMA 80  → {df['EMA_80'].iloc[-1]:.6f}\n"
-        f"  EMA 200 → {df['EMA_200'].iloc[-1]:.6f}\n\n"
+        f"🎯 *SQUEEZE\\:* {sq_emoji} {sq_msg}\n"
+        f"  Momentum\\: {sq_mom} {_e(sq_seta)}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *INDICADORES:*\n"
-        f"  RSI(14):   {rsi_s.iloc[-1]:.2f}\n"
-        f"  MACD:      {macd_obj.macd().iloc[-1]:.6f}\n"
-        f"  Sinal:     {macd_obj.macd_signal().iloc[-1]:.6f}\n"
-        f"  Stoch RSI: {stoch_rsi.iloc[-1]:.4f}\n"
-        f"  SAR:       {sar.iloc[-1]:.6f}\n"
-        f"  ATR(14):   {atr_s.iloc[-1]:.6f}\n\n"
+        f"📌 *MEDIAS MOVEIS\\:*\n"
+        f"  EMA 9   \\→ {_fp(df['EMA_9'].iloc[-1])}\n"
+        f"  EMA 21  \\→ {_fp(df['EMA_21'].iloc[-1])}\n"
+        f"  EMA 80  \\→ {_fp(df['EMA_80'].iloc[-1])}\n"
+        f"  EMA 200 \\→ {_fp(df['EMA_200'].iloc[-1])}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *VOLUME:*\n"
-        f"  Atual: {df['volume'].iloc[-1]:.2f}\n"
-        f"  MM21:  {df['vol_ma21'].iloc[-1]:.2f}\n"
-        f"  Ratio: {vol_ratio:.2f}x — {vol_forca}\n\n"
+        f"📊 *INDICADORES\\:*\n"
+        f"  RSI\\(14\\)\\:   {_fn(rsi_s.iloc[-1])}\n"
+        f"  MACD\\:      {_fn(macd_obj.macd().iloc[-1], 6)}\n"
+        f"  Sinal\\:     {_fn(macd_obj.macd_signal().iloc[-1], 6)}\n"
+        f"  Stoch RSI\\: {_fn(stoch_rsi.iloc[-1], 4)}\n"
+        f"  SAR\\:       {_fn(sar.iloc[-1], 6)}\n"
+        f"  ATR\\(14\\)\\:  {_fn(atr_s.iloc[-1], 6)}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📐 *FIBONACCI (50 candles):*\n"
-        + "\n".join(f"  {k}: {v}" for k, v in fib_ret.items())
-        + setup_txt +
-        f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💥 *LIQUIDAÇÕES:*\n"
-        f"{liquidacoes}\n\n"
-        f"⚠️ _Apenas para estudo. Não é recomendação._"
+        f"📊 *VOLUME\\:*\n"
+        f"  Atual\\: {_fn(df['volume'].iloc[-1])}\n"
+        f"  MM21\\:  {_fn(df['vol_ma21'].iloc[-1])}\n"
+        f"  Ratio\\: {_fn(vol_ratio)}x \\— {vol_forca_e}\n\n"
+
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📐 *FIBONACCI \\(50 candles\\)\\:*\n"
+        f"{fib_linhas}"
+        f"{setup_txt}\n"
+
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💥 *LIQUIDACOES\\:*\n"
+        f"{liq_esc}\n\n"
+
+        f"⚠️ Apenas para estudo\\. Nao e recomendacao\\."
     )
     return relatorio
