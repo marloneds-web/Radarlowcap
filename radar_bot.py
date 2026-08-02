@@ -15,6 +15,7 @@
 
 import asyncio
 import logging
+import os
 import schedule
 import time
 import threading
@@ -35,6 +36,10 @@ from utils import (
 )
 from scanner import escanear_lowcaps, formatar_ranking
 from analysis import gerar_relatorio_completo
+
+# ── SUPORTE A TÓPICOS ──────────────────────────────────────
+_thread_id_raw = os.getenv("TELEGRAM_THREAD_ID", "")
+MESSAGE_THREAD_ID = int(_thread_id_raw) if _thread_id_raw.isdigit() else None
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -87,13 +92,12 @@ def _reagendar(app: Application):
         if _main_loop is None or _main_loop.is_closed():
             log.error("❌ Loop principal não disponível para o scheduler.")
             return
-        # ✅ Submete a coroutine no loop do bot — sem criar novo loop
         future = asyncio.run_coroutine_threadsafe(
             enviar_alerta_automatico(app),
             _main_loop,
         )
         try:
-            future.result(timeout=300)  # aguarda até 5 min
+            future.result(timeout=300)
         except Exception as e:
             log.error(f"Erro no job do scheduler: {e}")
 
@@ -155,6 +159,7 @@ async def cmd_setchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    thread_info = f" ✅ (Tópico: `{MESSAGE_THREAD_ID}`)" if MESSAGE_THREAD_ID else ""
     msg = (
         "⚙️ *CONFIGURAÇÃO ATUAL*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -162,7 +167,7 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📊 Score mínimo:       `{utils.SCORE_MINIMO}/10`\n"
         f"🏆 Top moedas:         `{utils.TOP_N_MOEDAS}`\n"
         f"⏱️ Timeframe padrão:   `{utils.TIMEFRAME_PADRAO}`\n\n"
-        f"📡 Chat destino: `{chat_destino['id'] or 'não configurado'}`\n\n"
+        f"📡 Chat destino: `{chat_destino['id'] or 'não configurado'}`{thread_info}\n\n"
         "Exchanges ativas:\n"
         "  • Bitget \\(API pública\\)\n"
         "  • MEXC  \\(API pública\\)\n"
@@ -428,21 +433,32 @@ async def enviar_alerta_automatico(app: Application):
             score_minimo=utils.SCORE_MINIMO,
         )
         msg = formatar_ranking(resultados, utils.TIMEFRAME_PADRAO)
+
         for chunk in _split_msg(msg):
-            await app.bot.send_message(
-                chat_id=cid,
-                text=chunk,
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            kwargs = {
+                "chat_id": cid,
+                "text": chunk,
+                "parse_mode": ParseMode.MARKDOWN_V2,
+            }
+            if MESSAGE_THREAD_ID:
+                kwargs["message_thread_id"] = MESSAGE_THREAD_ID
+
+            await app.bot.send_message(**kwargs)
+
         log.info(f"✅ Alerta enviado para {cid} ({len(resultados)} moedas)")
+
     except Exception as e:
         log.error(f"Erro no alerta automático: {e}")
         try:
-            await app.bot.send_message(
-                chat_id=cid,
-                text=f"⚠️ Erro no scan automático: `{_escape(str(e))}`",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            kwargs = {
+                "chat_id": cid,
+                "text": f"⚠️ Erro no scan automático: `{_escape(str(e))}`",
+                "parse_mode": ParseMode.MARKDOWN_V2,
+            }
+            if MESSAGE_THREAD_ID:
+                kwargs["message_thread_id"] = MESSAGE_THREAD_ID
+
+            await app.bot.send_message(**kwargs)
         except Exception:
             pass
 
@@ -458,13 +474,12 @@ def iniciar_scheduler(app: Application):
         if _main_loop is None or _main_loop.is_closed():
             log.error("❌ Loop principal fechado — scheduler abortou.")
             return
-        # ✅ run_coroutine_threadsafe injeta a coroutine no loop do bot
         future = asyncio.run_coroutine_threadsafe(
             enviar_alerta_automatico(app),
             _main_loop,
         )
         try:
-            future.result(timeout=300)  # aguarda até 5 min
+            future.result(timeout=300)
         except Exception as e:
             log.error(f"Erro no job do scheduler: {e}")
 
@@ -493,7 +508,8 @@ def main():
         print("=" * 55)
         raise SystemExit(1)
 
-    log.info("🚀 Iniciando Radar Lowcap Bot...")
+    thread_info = f" | Tópico: {MESSAGE_THREAD_ID}" if MESSAGE_THREAD_ID else " | Grupo geral"
+    log.info(f"🚀 Iniciando Radar Lowcap Bot...{thread_info}")
 
     app = (
         Application.builder()
@@ -513,7 +529,6 @@ def main():
     # ── Post-init: captura o loop ANTES do scheduler ──────────
     async def post_init(application: Application):
         global _main_loop
-        # ✅ Captura o loop que o python-telegram-bot está usando
         _main_loop = asyncio.get_running_loop()
         log.info(f"✅ Loop principal capturado: {_main_loop}")
 
