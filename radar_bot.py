@@ -33,10 +33,12 @@ from utils import (
     TELEGRAM_CHAT_ID,
     TOKEN_OK,
     ADMIN_IDS,
+    TIMEFRAMES_VALIDOS,
 )
 from formatacao import esc
 from scanner import escanear_lowcaps, formatar_ranking
 from analysis import gerar_relatorio_completo
+from exchanges import iniciar_ws_okx
 
 # ── SUPORTE A TÓPICOS ──────────────────────────────────────
 _thread_id_raw = os.getenv("TELEGRAM_THREAD_ID", "")
@@ -346,9 +348,8 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── timeframe ─────────────────────────────────────────────
     elif parametro == "timeframe":
-        tfs_validos = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-        if valor_raw not in tfs_validos:
-            tfs_str = " \\| ".join(f"`{t}`" for t in tfs_validos)
+        if valor_raw not in TIMEFRAMES_VALIDOS:
+            tfs_str = " \\| ".join(f"`{t}`" for t in TIMEFRAMES_VALIDOS)
             await update.message.reply_text(
                 f"❌ Timeframe inválido\\.\n\nOpções válidas: {tfs_str}\n\n"
                 f"Exemplo: `/set timeframe 4h`",
@@ -432,6 +433,13 @@ async def cmd_analise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     par       = args[0].upper()
     timeframe = args[1].lower() if len(args) > 1 else utils.TIMEFRAME_PADRAO
+    if timeframe not in TIMEFRAMES_VALIDOS:
+        tfs_str = " \\| ".join(f"`{t}`" for t in TIMEFRAMES_VALIDOS)
+        await update.message.reply_text(
+            f"❌ Timeframe inválido\\.\n\nOpções válidas: {tfs_str}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
 
     await update.message.reply_text(
         f"📊 Analisando *{esc(par)}* no `{timeframe}`\\.\\.\\.",
@@ -526,9 +534,7 @@ def agendar_radar(app: Application):
 
 def main():
     if not TOKEN_OK:
-        print("=" * 55)
-        print("❌  TELEGRAM_BOT_TOKEN não configurado!")
-        print("=" * 55)
+        log.critical("❌ TELEGRAM_BOT_TOKEN não configurado!")
         raise SystemExit(1)
 
     thread_info = f" | Tópico: {MESSAGE_THREAD_ID}" if MESSAGE_THREAD_ID else " | Grupo geral"
@@ -565,6 +571,7 @@ def main():
         ])
 
         agendar_radar(application)
+        iniciar_ws_okx()
         log.info("✅ Bot iniciado com sucesso!")
 
     app.post_init = post_init

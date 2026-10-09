@@ -237,7 +237,7 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True,
                         "price":float(t.get("lastPr",0) or 0),
                         "change24h":round(float(t.get("change24h",0) or 0)*100,2)})
         except Exception as e:
-            print(f"⚠️ Bitget: {e}")
+            log.warning(f"⚠️ Bitget tickers: {e}")
 
     if "mexc" in exchanges:
         try:
@@ -250,7 +250,7 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True,
                         "price":float(t.get("lastPrice",0) or 0),
                         "change24h":round(float(t.get("priceChangePercent",0) or 0),2)})
         except Exception as e:
-            print(f"⚠️ MEXC: {e}")
+            log.warning(f"⚠️ MEXC tickers: {e}")
 
     if "bingx" in exchanges:
         try:
@@ -263,7 +263,7 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True,
                         "price":float(t.get("lastPrice",0) or 0),
                         "change24h":round(float(t.get("priceChangePercent",0) or 0),2)})
         except Exception as e:
-            print(f"⚠️ BingX: {e}")
+            log.warning(f"⚠️ BingX tickers: {e}")
 
     seen = {}
     for r in sorted(resultados, key=lambda x: x["volume"], reverse=True):
@@ -275,7 +275,7 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True,
         if permitidos is not None:
             seen = {s: r for s, r in seen.items()
                     if s.removesuffix("USDT") in permitidos}
-    print(f"✅ {len(seen)} lowcaps encontradas.")
+    log.info(f"✅ {len(seen)} lowcaps encontradas.")
     return list(seen.values())
 
 
@@ -298,7 +298,8 @@ def _norm_okx(symbol: str) -> str:
 
 
 # ── OKX WebSocket ──────────────────────────────────────────────
-def _iniciar_ws_okx():
+def iniciar_ws_okx():
+    """Inicia (uma vez) a thread do WebSocket de liquidações da OKX."""
     global _okx_ativo
 
     if not _WEBSOCKET_DISPONIVEL:
@@ -370,9 +371,6 @@ def _iniciar_ws_okx():
 
     threading.Thread(target=run, daemon=True, name="ws-okx-liq").start()
     log.info("🚀 OKX WebSocket de liquidações iniciado")
-
-
-_iniciar_ws_okx()
 
 
 # ── Bitfinex REST ──────────────────────────────────────────────

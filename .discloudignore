@@ -1,5 +1,4 @@
 .git/
-.env
 venv/
 __pycache__/
 *.pyc
@@ -7,3 +6,4 @@ __pycache__/
 .DS_Store
 *.log
 .pytest_cache/
+state.json
