@@ -122,17 +122,18 @@ def _golden_pocket(fib_ret: dict) -> tuple:
 
 def _nivel_fib_mais_proximo(preco: float, fib_ret: dict, tolerancia_pct: float = 1.5):
     """
-    Verifica se o preço está próximo de algum nível Fib.
-    Retorna (nivel_nome, nivel_valor) ou (None, None).
+    Retorna o nível Fib mais próximo do preço, se estiver dentro da tolerância:
+    (nivel_nome, nivel_valor) ou (None, None).
     Boroden: 3-4 ticks de tolerância → usamos % do preço.
     """
-    for nome, valor in fib_ret.items():
-        if valor == 0:
-            continue
-        dist_pct = abs(preco - valor) / preco * 100
-        if dist_pct <= tolerancia_pct:
-            return nome, valor
-    return None, None
+    candidatos = [
+        (abs(preco - valor) / preco * 100, nome, valor)
+        for nome, valor in fib_ret.items() if valor
+    ]
+    if not candidatos:
+        return None, None
+    dist_pct, nome, valor = min(candidatos)
+    return (nome, valor) if dist_pct <= tolerancia_pct else (None, None)
 
 
 def _projecao_alternada(swing_a: float, swing_b: float,
@@ -233,8 +234,18 @@ def analise_multi_timeframe(par: str, timeframes: tuple = ("1d", "4h", "1h")):
             resultados[tf] = direcao
         except Exception as e:
             resultados[tf] = f"Erro: {str(e)[:20]}"
-    confluencia = sum(1 for v in resultados.values() if "ALTA" in v)
+    confluencia = confluencia_mtf(resultados, "long")
     return resultados, confluencia
+
+
+def lado_da_direcao(direcao: str) -> str:
+    return "long" if "ALTA" in direcao else "short"
+
+
+def confluencia_mtf(mtf: dict, lado: str) -> int:
+    """Quantos timeframes estão alinhados com o lado do setup."""
+    alvo = "ALTA" if lado == "long" else "BAIXA"
+    return sum(1 for v in mtf.values() if alvo in str(v))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -257,7 +268,7 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
         rsi   = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
 
         swing_highs, swing_lows = _swing_points(df, janela=5)
-        lado = "long" if "ALTA" in direcao else "short"
+        lado = lado_da_direcao(direcao)
 
         # ── Filtros RSI ──────────────────────────────────────────
         if lado == "long"  and rsi > 70:
@@ -503,16 +514,20 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
     ).average_true_range()
 
     df["vol_ma21"] = df["volume"].rolling(21).mean()
-    vol_ratio      = df["volume"].iloc[-1] / df["vol_ma21"].iloc[-1]
+    vol_ma21_ult   = df["vol_ma21"].iloc[-1]
+    vol_ratio      = df["volume"].iloc[-1] / vol_ma21_ult if vol_ma21_ult > 0 else 0
     vol_forca      = "Alta 🔥" if vol_ratio > 1 else "Baixa"
 
     fib_ret, fib_exp, fib_meta     = calcular_fibonacci(df)
     direcao, crit_det, _           = avaliar_tendencia(df)
-    mtf, confluencia               = analise_multi_timeframe(par)
+    mtf, _                         = analise_multi_timeframe(par)
+    lado                           = lado_da_direcao(direcao)
 
     sq                             = calcular_squeeze_pro(df)
-    score, breakdown, fase_amd     = calcular_score_final(df, par, confluencia)
-    classe, classe_desc            = classificar_setup(score, fase_amd, sq["estado"], vol_ratio)
+    score, breakdown, fase_amd     = calcular_score_final(
+        df, par, confluencia_mtf(mtf, lado), lado
+    )
+    classe, classe_desc            = classificar_setup(score, fase_amd, lado)
     liquidacoes                    = obter_liquidacoes(par)
 
     st = calcular_setup_trade(df, direcao, mtf=mtf)

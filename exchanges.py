@@ -135,16 +135,24 @@ def mexc_tickers() -> list:
 # ══════════════════════════════════════════
 # INTERFACE UNIFICADA
 # ══════════════════════════════════════════
-def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto") -> pd.DataFrame:
+def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto",
+                  fechados=True) -> pd.DataFrame:
+    """
+    fechados=True descarta o último candle, que ainda está em formação
+    (volume parcial e corpo/sombras que ainda vão mudar).
+    """
+    def _limpar(df):
+        return df.iloc[:-1].reset_index(drop=True) if fechados else df
+
     mapa = {"bitget":bitget_candles,"mexc":mexc_candles,"bingx":bingx_candles}
     if exchange != "auto":
-        return mapa[exchange](symbol, timeframe, limit)
+        return _limpar(mapa[exchange](symbol, timeframe, limit))
     erros = {}
     for nome, func in [("bitget",bitget_candles),("mexc",mexc_candles),("bingx",bingx_candles)]:
         try:
             df = func(symbol, timeframe, limit)
-            if df is not None and len(df) >= 50:
-                return df
+            if df is not None and len(df) >= 51:
+                return _limpar(df)
         except Exception as e:
             erros[nome] = str(e)
     raise ConnectionError(f"Todas exchanges falharam para {symbol}:\n"+"\n".join(f"  {k}: {v}" for k,v in erros.items()))

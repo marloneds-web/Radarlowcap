@@ -7,6 +7,8 @@ from strategy import calcular_score_final, classificar_setup, calcular_squeeze_p
 from analysis import (
     avaliar_tendencia,
     analise_multi_timeframe,
+    confluencia_mtf,
+    lado_da_direcao,
     calcular_setup_trade,
     calcular_fibonacci,
     _swing_points,
@@ -73,16 +75,17 @@ def escanear_lowcaps(
             if df is None or len(df) < 100:
                 continue
 
-            mtf, confluencia            = analise_multi_timeframe(par)
-            score, breakdown, fase_amd  = calcular_score_final(df, par, confluencia)
             direcao, _, _               = avaliar_tendencia(df)
+            lado                        = lado_da_direcao(direcao)
+            mtf, _                      = analise_multi_timeframe(par)
+            score, breakdown, fase_amd  = calcular_score_final(
+                df, par, confluencia_mtf(mtf, lado), lado
+            )
             sq                          = calcular_squeeze_pro(df)
             rsi      = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
             vol_ma21 = df["volume"].rolling(21).mean().iloc[-1]
             vol_ratio = df["volume"].iloc[-1] / vol_ma21 if vol_ma21 > 0 else 0
-            classe, classe_desc = classificar_setup(
-                score, fase_amd, sq["estado"], vol_ratio
-            )
+            classe, classe_desc = classificar_setup(score, fase_amd, lado)
             setup_trade = calcular_setup_trade(df, direcao, mtf=mtf)
 
             if score >= score_minimo:
