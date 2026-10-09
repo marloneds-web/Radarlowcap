@@ -112,8 +112,12 @@ def calcular_fibonacci(df: pd.DataFrame, janela: int = 50):
 
 
 def _golden_pocket(fib_ret: dict) -> tuple:
-    """Retorna a zona Golden Pocket (61.8% ~ 65%)."""
-    return fib_ret.get("61.8%", 0), fib_ret.get("65%", 0)
+    """
+    Retorna a zona Golden Pocket (61.8% ~ 65%) como (limite_inferior, limite_superior).
+    Como as retrações são medidas a partir do topo, o nível 65% fica ABAIXO do 61.8%.
+    """
+    a, b = fib_ret.get("61.8%", 0), fib_ret.get("65%", 0)
+    return min(a, b), max(a, b)
 
 
 def _nivel_fib_mais_proximo(preco: float, fib_ret: dict, tolerancia_pct: float = 1.5):
@@ -266,9 +270,9 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
         golden_low, golden_high    = _golden_pocket(fib_ret)
 
         # Verifica se preço está no Golden Pocket
-        em_golden_pocket = (
+        em_golden_pocket = bool(
             golden_low and golden_high
-            and golden_low <= preco <= golden_high * 1.005
+            and golden_low * 0.995 <= preco <= golden_high * 1.005
         )
 
         # Nível Fib mais próximo
@@ -586,8 +590,7 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
         f"  {_e(k)}\\: {_fp(v)}" for k, v in fib_ret.items()
     )
 
-    gp_low  = fib_ret.get("61.8%", 0)
-    gp_high = fib_ret.get("65%",   0)
+    gp_low, gp_high = _golden_pocket(fib_ret)
     gp_txt  = (
         f"  🎯 Golden Pocket\\: {_fp(gp_low)} \\— {_fp(gp_high)}\n"
         if gp_low and gp_high else ""

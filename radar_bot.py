@@ -19,6 +19,7 @@ import os
 import schedule
 import time
 import threading
+from functools import wraps
 
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -33,6 +34,7 @@ from utils import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TOKEN_OK,
+    ADMIN_IDS,
 )
 from scanner import escanear_lowcaps, formatar_ranking
 from analysis import gerar_relatorio_completo
@@ -54,6 +56,9 @@ chat_destino = {"id": TELEGRAM_CHAT_ID}
 
 # ── Loop principal do bot (preenchido no post_init) ───────────
 _main_loop: asyncio.AbstractEventLoop = None
+
+# Impede dois scans simultâneos (manual + automático)
+_scan_lock = asyncio.Lock()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -82,6 +87,33 @@ def _split_msg(text: str, limit: int = 4000) -> list[str]:
     if text:
         chunks.append(text)
     return chunks
+
+
+def admin_only(handler):
+    """Restringe o comando aos usuários listados em ADMIN_IDS."""
+    @wraps(handler)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not ADMIN_IDS:
+            # Sem ADMIN_IDS configurado: mantém compatibilidade, mas avisa no log
+            return await handler(update, ctx)
+        user = update.effective_user
+        if user is None or user.id not in ADMIN_IDS:
+            log.warning(f"Acesso negado a /{handler.__name__[4:]} para user {user.id if user else '?'}")
+            await update.message.reply_text("⛔ Comando restrito ao administrador do bot.")
+            return
+        return await handler(update, ctx)
+    return wrapper
+
+
+async def _executar_scan() -> tuple[str, int]:
+    """Roda o scan numa thread (não bloqueia o bot) e devolve o ranking formatado."""
+    resultados = await asyncio.to_thread(
+        escanear_lowcaps,
+        top_n=utils.TOP_N_MOEDAS,
+        timeframe=utils.TIMEFRAME_PADRAO,
+        score_minimo=utils.SCORE_MINIMO,
+    )
+    return formatar_ranking(resultados, utils.TIMEFRAME_PADRAO), len(resultados)
 
 
 def _reagendar(app: Application):
@@ -146,6 +178,7 @@ async def cmd_ajuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
 
 
+@admin_only
 async def cmd_setchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     chat_destino["id"] = chat_id
@@ -159,7 +192,7 @@ async def cmd_setchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    thread_info = f" ✅ (Tópico: `{MESSAGE_THREAD_ID}`)" if MESSAGE_THREAD_ID else ""
+    thread_info = f" ✅ \\(Tópico: `{MESSAGE_THREAD_ID}`\\)" if MESSAGE_THREAD_ID else ""
     msg = (
         "⚙️ *CONFIGURAÇÃO ATUAL*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -181,6 +214,7 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # COMANDO /set
 # ══════════════════════════════════════════════════════════════
 
+@admin_only
 async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
 
@@ -349,7 +383,11 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # COMANDO /radar
 # ══════════════════════════════════════════════════════════════
 
+@admin_only
 async def cmd_radar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if _scan_lock.locked():
+        await update.message.reply_text("⏳ Já existe um scan em andamento. Aguarde o resultado.")
+        return
     await update.message.reply_text(
         f"🔍 *Iniciando scan manual\\.\\.\\.*\n"
         f"Score ≥ `{utils.SCORE_MINIMO}` \\| Top `{utils.TOP_N_MOEDAS}` \\| `{utils.TIMEFRAME_PADRAO.upper()}`\n\n"
@@ -357,12 +395,8 @@ async def cmd_radar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2,
     )
     try:
-        resultados = escanear_lowcaps(
-            top_n=utils.TOP_N_MOEDAS,
-            timeframe=utils.TIMEFRAME_PADRAO,
-            score_minimo=utils.SCORE_MINIMO,
-        )
-        msg = formatar_ranking(resultados, utils.TIMEFRAME_PADRAO)
+        async with _scan_lock:
+            msg, _ = await _executar_scan()
         for chunk in _split_msg(msg):
             await update.message.reply_text(
                 chunk,
@@ -397,7 +431,7 @@ async def cmd_analise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2,
     )
     try:
-        relatorio = gerar_relatorio_completo(par, timeframe)
+        relatorio = await asyncio.to_thread(gerar_relatorio_completo, par, timeframe)
         for chunk in _split_msg(relatorio):
             await update.message.reply_text(
                 chunk,
@@ -426,13 +460,12 @@ async def enviar_alerta_automatico(app: Application):
         f"⏰ Scan automático | score≥{utils.SCORE_MINIMO} "
         f"| top{utils.TOP_N_MOEDAS} | {utils.TIMEFRAME_PADRAO}"
     )
+    if _scan_lock.locked():
+        log.info("⏭️ Scan automático pulado: outro scan em andamento.")
+        return
     try:
-        resultados = escanear_lowcaps(
-            top_n=utils.TOP_N_MOEDAS,
-            timeframe=utils.TIMEFRAME_PADRAO,
-            score_minimo=utils.SCORE_MINIMO,
-        )
-        msg = formatar_ranking(resultados, utils.TIMEFRAME_PADRAO)
+        async with _scan_lock:
+            msg, qtd = await _executar_scan()
 
         for chunk in _split_msg(msg):
             kwargs = {
@@ -445,7 +478,7 @@ async def enviar_alerta_automatico(app: Application):
 
             await app.bot.send_message(**kwargs)
 
-        log.info(f"✅ Alerta enviado para {cid} ({len(resultados)} moedas)")
+        log.info(f"✅ Alerta enviado para {cid} ({qtd} moedas)")
 
     except Exception as e:
         log.error(f"Erro no alerta automático: {e}")
@@ -510,6 +543,8 @@ def main():
 
     thread_info = f" | Tópico: {MESSAGE_THREAD_ID}" if MESSAGE_THREAD_ID else " | Grupo geral"
     log.info(f"🚀 Iniciando Radar Lowcap Bot...{thread_info}")
+    if not ADMIN_IDS:
+        log.warning("⚠️ ADMIN_IDS não configurado — qualquer usuário pode usar /radar, /set e /setchat.")
 
     app = (
         Application.builder()

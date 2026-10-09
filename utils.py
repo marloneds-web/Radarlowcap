@@ -9,6 +9,12 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Usuários autorizados a usar comandos administrativos (/radar, /set, /setchat)
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",")
+    if x.lstrip("-").isdigit()
+}
+
 # ── POLLING ───────────────────────────────────────────────────
 POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", "30"))
 MAX_ALERTS_PER_CYCLE  = int(os.getenv("MAX_ALERTS_PER_CYCLE",  "10"))
