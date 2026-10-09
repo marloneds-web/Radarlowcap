@@ -7,7 +7,7 @@ import json
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from utils import MIN_VOL_24H
+from utils import MIN_VOL_24H, MCAP_MIN, MCAP_MAX, COINGECKO_BASE, COINGECKO_API_KEY
 
 log = logging.getLogger(__name__)
 
@@ -151,9 +151,61 @@ def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto") -> pd
 
 
 # ══════════════════════════════════════════
+# MARKET CAP (CoinGecko)
+# ══════════════════════════════════════════
+_MCAP_CACHE_TTL = 6 * 3600
+_mcap_cache = {"ts": 0.0, "simbolos": None}
+_mcap_lock  = threading.Lock()
+
+
+def _simbolos_por_mcap(mcap_min=MCAP_MIN, mcap_max=MCAP_MAX, max_paginas=12):
+    """
+    Retorna o set de símbolos (ex.: {"PEPE", "WIF"}) com market cap entre
+    mcap_min e mcap_max, ou None se a CoinGecko estiver indisponível.
+    Resultado fica em cache por 6h (market cap muda devagar).
+    """
+    with _mcap_lock:
+        if _mcap_cache["simbolos"] is not None and time.time() - _mcap_cache["ts"] < _MCAP_CACHE_TTL:
+            return _mcap_cache["simbolos"]
+
+        headers  = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+        simbolos = set()
+        try:
+            for pagina in range(1, max_paginas + 1):
+                params = {"vs_currency": "usd", "order": "market_cap_desc",
+                          "per_page": 250, "page": pagina}
+                r = requests.get(f"{COINGECKO_BASE}/coins/markets", params=params,
+                                 headers=headers, timeout=TIMEOUT)
+                if r.status_code == 429:  # rate limit do plano gratuito
+                    time.sleep(30)
+                    r = requests.get(f"{COINGECKO_BASE}/coins/markets", params=params,
+                                     headers=headers, timeout=TIMEOUT)
+                r.raise_for_status()
+                moedas = r.json()
+                if not moedas:
+                    break
+                for c in moedas:
+                    mcap = c.get("market_cap") or 0
+                    if mcap_min <= mcap <= mcap_max:
+                        simbolos.add(str(c.get("symbol", "")).upper())
+                # Ordenado por mcap desc: ao passar do mínimo, acabou
+                if (moedas[-1].get("market_cap") or 0) < mcap_min:
+                    break
+                time.sleep(2.5)
+        except Exception as e:
+            log.warning(f"⚠️ CoinGecko indisponível ({e}) — filtro de market cap desativado neste ciclo.")
+            return None
+
+        _mcap_cache.update(ts=time.time(), simbolos=simbolos)
+        log.info(f"✅ CoinGecko: {len(simbolos)} moedas entre ${mcap_min:,.0f} e ${mcap_max:,.0f}")
+        return simbolos
+
+
+# ══════════════════════════════════════════
 # LISTAR LOWCAPS
 # ══════════════════════════════════════════
-def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> list:
+def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True,
+                   filtrar_mcap=True) -> list:
     if exchanges is None:
         exchanges = ["bitget","mexc","bingx"]
     resultados = []
@@ -201,6 +253,12 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> lis
     for r in sorted(resultados, key=lambda x: x["volume"], reverse=True):
         if r["symbol"] not in seen:
             seen[r["symbol"]] = r
+
+    if filtrar_mcap:
+        permitidos = _simbolos_por_mcap()
+        if permitidos is not None:
+            seen = {s: r for s, r in seen.items()
+                    if s.removesuffix("USDT") in permitidos}
     print(f"✅ {len(seen)} lowcaps encontradas.")
     return list(seen.values())
 
