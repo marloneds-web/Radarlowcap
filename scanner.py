@@ -1,7 +1,7 @@
-# scanner.py — COMPLETO E CORRIGIDO
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ta
-import numpy as np
 from exchanges import obter_candles, listar_lowcaps
 from strategy import calcular_score_final, classificar_setup, calcular_squeeze_pro
 from analysis import (
@@ -10,11 +10,10 @@ from analysis import (
     confluencia_mtf,
     lado_da_direcao,
     calcular_setup_trade,
-    calcular_fibonacci,
-    _swing_points,
-    _detectar_fvg,
 )
-from utils import SCORE_MINIMO, TOP_N_MOEDAS, TIMEFRAME_PADRAO
+from utils import SCORE_MINIMO, TOP_N_MOEDAS, TIMEFRAME_PADRAO, SCAN_WORKERS
+
+log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -58,63 +57,87 @@ def _fmt_price(price: float) -> str:
 # SCAN PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
+def _analisar_moeda(m: dict, timeframe: str, score_minimo: int):
+    """Analisa uma moeda; retorna o dict do resultado ou None se não passar no score."""
+    par = m["symbol"]
+    df  = obter_candles(par, timeframe, limit=300, preferida=m["exchange"])
+    if df is None or len(df) < 100:
+        return None
+
+    direcao, _, _ = avaliar_tendencia(df)
+    lado          = lado_da_direcao(direcao)
+
+    # A confluência MTF vale no máximo 1 ponto: se nem com ela a moeda chega
+    # ao score mínimo, poupa as 3 requisições extras do multi-timeframe.
+    score, _, _ = calcular_score_final(df, par, 3, lado)
+    if score < score_minimo:
+        return None
+
+    mtf, _ = analise_multi_timeframe(par, preferida=m["exchange"])
+    score, breakdown, fase_amd = calcular_score_final(
+        df, par, confluencia_mtf(mtf, lado), lado
+    )
+    if score < score_minimo:
+        return None
+
+    sq        = calcular_squeeze_pro(df)
+    rsi       = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
+    vol_ma21  = df["volume"].rolling(21).mean().iloc[-1]
+    vol_ratio = df["volume"].iloc[-1] / vol_ma21 if vol_ma21 > 0 else 0
+    classe, classe_desc = classificar_setup(score, fase_amd, lado)
+
+    return {
+        "symbol":      par,
+        "exchange":    m["exchange"],
+        "score":       score,
+        "classe":      classe,
+        "classe_desc": classe_desc,
+        "direcao":     direcao,
+        "fase_amd":    fase_amd,
+        "squeeze":     sq["estado"],
+        "rsi":         round(rsi, 2),
+        "vol_ratio":   round(vol_ratio, 2),
+        "change24h":   m["change24h"],
+        "price":       m["price"],
+        "breakdown":   breakdown,
+        "mtf":         mtf,
+        "setup_trade": calcular_setup_trade(df, direcao, mtf=mtf),
+    }
+
+
 def escanear_lowcaps(
     top_n=TOP_N_MOEDAS,
     timeframe=TIMEFRAME_PADRAO,
-    score_minimo=SCORE_MINIMO
+    score_minimo=SCORE_MINIMO,
+    workers=SCAN_WORKERS,
 ) -> list:
-    moedas  = listar_lowcaps()
-    total   = len(moedas)
+    moedas     = listar_lowcaps()
+    total      = len(moedas)
     resultados = []
-    print(f"🔍 Escaneando {total} lowcaps no timeframe {timeframe}...")
+    falhas     = 0
+    log.info(f"🔍 Escaneando {total} lowcaps no timeframe {timeframe} ({workers} workers)...")
 
-    for i, m in enumerate(moedas, 1):
-        par = m["symbol"]
-        try:
-            df = obter_candles(par, timeframe, limit=300)
-            if df is None or len(df) < 100:
-                continue
-
-            direcao, _, _               = avaliar_tendencia(df)
-            lado                        = lado_da_direcao(direcao)
-            mtf, _                      = analise_multi_timeframe(par)
-            score, breakdown, fase_amd  = calcular_score_final(
-                df, par, confluencia_mtf(mtf, lado), lado
-            )
-            sq                          = calcular_squeeze_pro(df)
-            rsi      = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
-            vol_ma21 = df["volume"].rolling(21).mean().iloc[-1]
-            vol_ratio = df["volume"].iloc[-1] / vol_ma21 if vol_ma21 > 0 else 0
-            classe, classe_desc = classificar_setup(score, fase_amd, lado)
-            setup_trade = calcular_setup_trade(df, direcao, mtf=mtf)
-
-            if score >= score_minimo:
-                resultados.append({
-                    "symbol":      par,
-                    "exchange":    m["exchange"],
-                    "score":       score,
-                    "classe":      classe,
-                    "classe_desc": classe_desc,
-                    "direcao":     direcao,
-                    "fase_amd":    fase_amd,
-                    "squeeze":     sq["estado"],
-                    "rsi":         round(rsi, 2),
-                    "vol_ratio":   round(vol_ratio, 2),
-                    "change24h":   m["change24h"],
-                    "price":       m["price"],
-                    "breakdown":   breakdown,
-                    "mtf":         mtf,
-                    "setup_trade": setup_trade,
-                })
-
-            if i % 20 == 0:
-                print(f"  ⏳ {i}/{total} processados...")
-
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futuros = {
+            pool.submit(_analisar_moeda, m, timeframe, score_minimo): m["symbol"]
+            for m in moedas
+        }
+        for i, fut in enumerate(as_completed(futuros), 1):
+            try:
+                r = fut.result()
+                if r:
+                    resultados.append(r)
+            except Exception as e:
+                falhas += 1
+                log.debug(f"Falha ao analisar {futuros[fut]}: {e}")
+            if i % 50 == 0:
+                log.info(f"  ⏳ {i}/{total} processados...")
 
     resultados.sort(key=lambda x: x["score"], reverse=True)
-    print(f"✅ Scan completo. {len(resultados)} moedas com score ≥ {score_minimo}.")
+    log.info(
+        f"✅ Scan completo. {len(resultados)} moedas com score ≥ {score_minimo} "
+        f"({falhas} falhas de dados)."
+    )
     return resultados[:top_n]
 
 

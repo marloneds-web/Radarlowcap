@@ -24,6 +24,11 @@ except ImportError:
 
 TIMEOUT = 10
 
+# Sessão HTTP compartilhada: reaproveita conexões TCP/TLS entre requisições
+# (o scan faz centenas de chamadas às mesmas exchanges).
+_http = requests.Session()
+_http.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=32))
+
 TIMEFRAME_MAP = {
     "bitget": {
         "1m":"1min","5m":"5min","15m":"15min","30m":"30min",
@@ -61,7 +66,7 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
 def bitget_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
     tf  = TIMEFRAME_MAP["bitget"].get(timeframe, "1H")
     url = f"{BITGET_BASE}/api/v2/spot/market/candles"
-    r   = requests.get(url, params={"symbol":symbol,"granularity":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
+    r   = _http.get(url, params={"symbol":symbol,"granularity":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != "00000" or not data.get("data"):
@@ -72,7 +77,7 @@ def bitget_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
 
 
 def bitget_tickers() -> list:
-    r = requests.get(f"{BITGET_BASE}/api/v2/spot/market/tickers", timeout=TIMEOUT)
+    r = _http.get(f"{BITGET_BASE}/api/v2/spot/market/tickers", timeout=TIMEOUT)
     r.raise_for_status()
     d = r.json()
     if d.get("code") != "00000":
@@ -87,7 +92,7 @@ def bingx_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
     sym = symbol.replace("USDT","-USDT").replace("--","-")
     tf  = TIMEFRAME_MAP["bingx"].get(timeframe, "1h")
     url = f"{BINGX_BASE}/openApi/spot/v2/market/kline"
-    r   = requests.get(url, params={"symbol":sym,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
+    r   = _http.get(url, params={"symbol":sym,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != 0 or not data.get("data"):
@@ -99,7 +104,7 @@ def bingx_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
 
 
 def bingx_tickers() -> list:
-    r = requests.get(f"{BINGX_BASE}/openApi/spot/v1/ticker/24hr", timeout=TIMEOUT)
+    r = _http.get(f"{BINGX_BASE}/openApi/spot/v1/ticker/24hr", timeout=TIMEOUT)
     r.raise_for_status()
     d = r.json()
     if d.get("code") != 0:
@@ -113,7 +118,7 @@ def bingx_tickers() -> list:
 def mexc_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
     tf  = TIMEFRAME_MAP["mexc"].get(timeframe, "60m")
     url = f"{MEXC_BASE}/api/v3/klines"
-    r   = requests.get(url, params={"symbol":symbol,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
+    r   = _http.get(url, params={"symbol":symbol,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
     r.raise_for_status()
     raw = r.json()
     if not isinstance(raw, list) or len(raw) == 0:
@@ -124,7 +129,7 @@ def mexc_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
 
 
 def mexc_tickers() -> list:
-    r = requests.get(f"{MEXC_BASE}/api/v3/ticker/24hr", timeout=TIMEOUT)
+    r = _http.get(f"{MEXC_BASE}/api/v3/ticker/24hr", timeout=TIMEOUT)
     r.raise_for_status()
     d = r.json()
     if not isinstance(d, list):
@@ -136,10 +141,11 @@ def mexc_tickers() -> list:
 # INTERFACE UNIFICADA
 # ══════════════════════════════════════════
 def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto",
-                  fechados=True) -> pd.DataFrame:
+                  fechados=True, preferida=None) -> pd.DataFrame:
     """
     fechados=True descarta o último candle, que ainda está em formação
     (volume parcial e corpo/sombras que ainda vão mudar).
+    preferida: exchange tentada primeiro no modo "auto" (ex.: onde o par foi listado).
     """
     def _limpar(df):
         return df.iloc[:-1].reset_index(drop=True) if fechados else df
@@ -147,8 +153,10 @@ def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto",
     mapa = {"bitget":bitget_candles,"mexc":mexc_candles,"bingx":bingx_candles}
     if exchange != "auto":
         return _limpar(mapa[exchange](symbol, timeframe, limit))
+    ordem = sorted(mapa, key=lambda nome: nome != preferida)
     erros = {}
-    for nome, func in [("bitget",bitget_candles),("mexc",mexc_candles),("bingx",bingx_candles)]:
+    for nome in ordem:
+        func = mapa[nome]
         try:
             df = func(symbol, timeframe, limit)
             if df is not None and len(df) >= 51:
@@ -182,11 +190,11 @@ def _simbolos_por_mcap(mcap_min=MCAP_MIN, mcap_max=MCAP_MAX, max_paginas=12):
             for pagina in range(1, max_paginas + 1):
                 params = {"vs_currency": "usd", "order": "market_cap_desc",
                           "per_page": 250, "page": pagina}
-                r = requests.get(f"{COINGECKO_BASE}/coins/markets", params=params,
+                r = _http.get(f"{COINGECKO_BASE}/coins/markets", params=params,
                                  headers=headers, timeout=TIMEOUT)
                 if r.status_code == 429:  # rate limit do plano gratuito
                     time.sleep(30)
-                    r = requests.get(f"{COINGECKO_BASE}/coins/markets", params=params,
+                    r = _http.get(f"{COINGECKO_BASE}/coins/markets", params=params,
                                      headers=headers, timeout=TIMEOUT)
                 r.raise_for_status()
                 moedas = r.json()
@@ -389,7 +397,7 @@ def _liquidacoes_bitfinex(symbol: str, limit: int = 100) -> list[dict]:
     """
     try:
         url = "https://api-pub.bitfinex.com/v2/liquidations/hist"
-        r   = requests.get(url, params={"limit": limit, "sort": -1}, timeout=6)
+        r   = _http.get(url, params={"limit": limit, "sort": -1}, timeout=6)
         r.raise_for_status()
         base_req = symbol.upper().removesuffix("USDT").removesuffix("USD")
         eventos = []

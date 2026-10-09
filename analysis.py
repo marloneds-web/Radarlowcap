@@ -178,19 +178,16 @@ def _swing_points(df: pd.DataFrame, janela: int = 5):
 # ══════════════════════════════════════════════════════════════
 
 def _detectar_fvg(df: pd.DataFrame, lado: str = "long") -> list:
-    fvgs = []
-    for i in range(2, len(df)):
-        if lado == "long":
-            gap_low  = df["low"].iloc[i]
-            gap_high = df["high"].iloc[i - 2]
-            if gap_low > gap_high:
-                fvgs.append((gap_high + gap_low) / 2)
-        else:
-            gap_high = df["high"].iloc[i]
-            gap_low  = df["low"].iloc[i - 2]
-            if gap_high < gap_low:
-                fvgs.append((gap_high + gap_low) / 2)
-    return fvgs[-3:] if fvgs else []
+    """Pontos médios dos 3 Fair Value Gaps mais recentes."""
+    high_2 = df["high"].shift(2)
+    low_2  = df["low"].shift(2)
+    if lado == "long":
+        mask = df["low"] > high_2
+        meio = (high_2 + df["low"]) / 2
+    else:
+        mask = df["high"] < low_2
+        meio = (df["high"] + low_2) / 2
+    return meio[mask].tail(3).tolist()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -225,11 +222,12 @@ def avaliar_tendencia(df: pd.DataFrame):
 # MULTI-TIMEFRAME
 # ══════════════════════════════════════════════════════════════
 
-def analise_multi_timeframe(par: str, timeframes: tuple = ("1d", "4h", "1h")):
+def analise_multi_timeframe(par: str, timeframes: tuple = ("1d", "4h", "1h"),
+                            preferida: str = None):
     resultados = {}
     for tf in timeframes:
         try:
-            df = obter_candles(par, tf, limit=200)
+            df = obter_candles(par, tf, limit=200, preferida=preferida)
             direcao, _, _ = avaliar_tendencia(df)
             resultados[tf] = direcao
         except Exception as e:

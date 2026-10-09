@@ -27,6 +27,7 @@ MIN_VOL_24H    = float(os.getenv("MIN_VOL_24H",   "500000"))
 SCORE_MINIMO     = int(os.getenv("SCORE_MINIMO",   "5"))
 TOP_N_MOEDAS     = int(os.getenv("TOP_N_MOEDAS",   "10"))
 TIMEFRAME_PADRAO = os.getenv("TIMEFRAME_PADRAO",    "4h")
+SCAN_WORKERS     = int(os.getenv("SCAN_WORKERS",   "8"))  # requisições paralelas no scan
 
 # ── COINGECKO ─────────────────────────────────────────────────
 COINGECKO_BASE    = "https://api.coingecko.com/api/v3"
