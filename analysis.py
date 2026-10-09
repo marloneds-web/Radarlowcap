@@ -2,40 +2,12 @@ import pandas as pd
 import numpy as np
 import ta
 from exchanges import obter_candles
+from formatacao import esc, fmt_price
 
 
 # ══════════════════════════════════════════════════════════════
 # HELPERS DE ESCAPE — MarkdownV2
 # ══════════════════════════════════════════════════════════════
-
-def _e(text) -> str:
-    """Escapa TODOS os caracteres reservados do MarkdownV2."""
-    text = str(text)
-    for ch in r"\_*[]()~`>#+-=|{}.!:":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
-def _c(text) -> str:
-    """Envolve em bloco de código inline (não precisa escapar dentro)."""
-    return f"`{text}`"
-
-
-def _b(text) -> str:
-    """Negrito seguro."""
-    return f"*{_e(str(text))}*"
-
-
-def _i(text) -> str:
-    """
-    Itálico seguro — escapa tudo EXCETO underscore,
-    que é o delimitador do itálico no MarkdownV2.
-    """
-    inner = str(text)
-    for ch in r"\*[]()~`>#+-=|{}.!:":
-        inner = inner.replace(ch, f"\\{ch}")
-    return f"_{inner}_"
-
 
 def _safe(text) -> str:
     """
@@ -532,28 +504,23 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
 
     # ── Helpers locais de formatação numérica ─────────────────
     def _fp(v) -> str:
-        f = float(v)
-        if f < 0.0001:   s = f"{f:.8f}"
-        elif f < 1:      s = f"{f:.6f}"
-        elif f < 1000:   s = f"{f:.4f}"
-        else:            s = f"{f:,.2f}"
-        return f"`{s}`"
+        return f"`{fmt_price(v)}`"
 
     def _fn(v, decimais=2) -> str:
-        return _e(f"{float(v):.{decimais}f}")
+        return esc(f"{float(v):.{decimais}f}")
 
     # ── Bloco de setup ────────────────────────────────────────
     if st.get("valido"):
         lado_label = "🟢 LONG" if st["lado"] == "long" else "🔴 SHORT"
-        rr_esc     = _e(str(st["rr"]))
-        risco_esc  = _e(f"{st['risco_pct']}%")
-        sl_tipo_e  = _e(_safe(st["sl_tipo"]))
+        rr_esc     = esc(str(st["rr"]))
+        risco_esc  = esc(f"{st['risco_pct']}%")
+        sl_tipo_e  = esc(_safe(st["sl_tipo"]))
         gp_badge   = " ⭐ _Golden Pocket_" if st.get("em_golden_pocket") else ""
-        fib_badge  = f" \\({_e(st['nivel_fib'])}\\)" if st.get("nivel_fib") and st["nivel_fib"] != "—" else ""
+        fib_badge  = f" \\({esc(st['nivel_fib'])}\\)" if st.get("nivel_fib") and st["nivel_fib"] != "—" else ""
 
         avisos_linhas = ""
         for av in st.get("avisos", []):
-            avisos_linhas += f"  ⚠️ {_e(_safe(str(av)))}\n"
+            avisos_linhas += f"  ⚠️ {esc(_safe(str(av)))}\n"
 
         setup_txt = (
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -568,7 +535,7 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
             + f"  💡 Apos TP1\\: mover SL para entrada \\(breakeven\\)\n"
         )
     else:
-        motivo_e  = _e(_safe(st.get("motivo", "nao identificado")))
+        motivo_e  = esc(_safe(st.get("motivo", "nao identificado")))
         setup_txt = (
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️ *SETUP:* {motivo_e}\n"
@@ -582,25 +549,25 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
     )
 
     # ── MTF ───────────────────────────────────────────────────
-    mtf_1d = _e(_safe(mtf.get("1d", "N/A")))
-    mtf_4h = _e(_safe(mtf.get("4h", "N/A")))
-    mtf_1h = _e(_safe(mtf.get("1h", "N/A")))
+    mtf_1d = esc(_safe(mtf.get("1d", "N/A")))
+    mtf_4h = esc(_safe(mtf.get("4h", "N/A")))
+    mtf_1h = esc(_safe(mtf.get("1h", "N/A")))
 
     # ── Squeeze ────────────────────────────────────────────────
     sq_emoji = sq.get("emoji", "")
-    sq_msg   = _e(_safe(sq.get("msg", "")))
-    sq_mom   = _e(_safe(str(sq.get("momentum", ""))))
+    sq_msg   = esc(_safe(sq.get("msg", "")))
+    sq_mom   = esc(_safe(str(sq.get("momentum", ""))))
     sq_seta  = "↑" if sq.get("crescendo") else "↓"
 
     # ── Breakdown ─────────────────────────────────────────────
-    breakdown_txt = "\n".join(_e(_safe(str(b))) for b in breakdown)
+    breakdown_txt = "\n".join(esc(_safe(str(b))) for b in breakdown)
 
     # ── Critérios tendência ────────────────────────────────────
-    crit_det_esc = _e(_safe(crit_det))
+    crit_det_esc = esc(_safe(crit_det))
 
     # ── Fibonacci — retrações + Golden Pocket ─────────────────
     fib_linhas = "\n".join(
-        f"  {_e(k)}\\: {_fp(v)}" for k, v in fib_ret.items()
+        f"  {esc(k)}\\: {_fp(v)}" for k, v in fib_ret.items()
     )
 
     gp_low, gp_high = _golden_pocket(fib_ret)
@@ -611,25 +578,25 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
 
     # ── Extensões Fib ──────────────────────────────────────────
     ext_linhas = "\n".join(
-        f"  {_e(k)}\\: {_fp(v)}"
+        f"  {esc(k)}\\: {_fp(v)}"
         for k, v in fib_exp.items()
         if not k.startswith("ext_")   # mostra só as de cima
     )
 
     # ── Liquidações ────────────────────────────────────────────
-    liq_esc = _e(_safe(str(liquidacoes)))
+    liq_esc = esc(_safe(str(liquidacoes)))
 
     # ── Classe / descrição ─────────────────────────────────────
-    classe_e      = _e(_safe(classe))
-    classe_desc_e = _e(_safe(classe_desc))
-    direcao_e     = _e(_safe(direcao))
-    vol_forca_e   = _e(_safe(vol_forca))
+    classe_e      = esc(_safe(classe))
+    classe_desc_e = esc(_safe(classe_desc))
+    direcao_e     = esc(_safe(direcao))
+    vol_forca_e   = esc(_safe(vol_forca))
 
     relatorio = (
-        f"📊 *{_e(par)}* \\| `{_e(timeframe.upper())}`\n"
+        f"📊 *{esc(par)}* \\| `{esc(timeframe.upper())}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"{score_emoji} *SCORE\\: {_e(str(score))}/10* \\— {classe_e}\n"
+        f"{score_emoji} *SCORE\\: {esc(str(score))}/10* \\— {classe_e}\n"
         f"{classe_desc_e}\n\n"
         f"{breakdown_txt}\n\n"
 
@@ -645,7 +612,7 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
 
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *SQUEEZE\\:* {sq_emoji} {sq_msg}\n"
-        f"  Momentum\\: {sq_mom} {_e(sq_seta)}\n\n"
+        f"  Momentum\\: {sq_mom} {esc(sq_seta)}\n\n"
 
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *MEDIAS MOVEIS\\:*\n"

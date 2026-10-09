@@ -14,11 +14,9 @@
 """
 
 import asyncio
+import json
 import logging
 import os
-import schedule
-import time
-import threading
 from functools import wraps
 
 from telegram import Update, BotCommand
@@ -36,6 +34,7 @@ from utils import (
     TOKEN_OK,
     ADMIN_IDS,
 )
+from formatacao import esc
 from scanner import escanear_lowcaps, formatar_ranking
 from analysis import gerar_relatorio_completo
 
@@ -54,8 +53,9 @@ log = logging.getLogger(__name__)
 # ── Estado global ─────────────────────────────────────────────
 chat_destino = {"id": TELEGRAM_CHAT_ID}
 
-# ── Loop principal do bot (preenchido no post_init) ───────────
-_main_loop: asyncio.AbstractEventLoop = None
+# Configurações alteradas por /set e /setchat sobrevivem a reinícios
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
+_CHAVES_ESTADO = ("SCORE_MINIMO", "TOP_N_MOEDAS", "POLL_INTERVAL_MINUTES", "TIMEFRAME_PADRAO")
 
 # Impede dois scans simultâneos (manual + automático)
 _scan_lock = asyncio.Lock()
@@ -64,13 +64,6 @@ _scan_lock = asyncio.Lock()
 # ══════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════
-
-def _escape(text: str) -> str:
-    """Escapa caracteres especiais do MarkdownV2."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
 
 def _split_msg(text: str, limit: int = 4000) -> list[str]:
     """
@@ -105,6 +98,36 @@ def admin_only(handler):
     return wrapper
 
 
+def _carregar_estado():
+    """Aplica o estado salvo (se houver) sobre os valores do .env."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            estado = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log.warning(f"⚠️ Não foi possível ler {STATE_FILE}: {e}")
+        return
+    for chave in _CHAVES_ESTADO:
+        if chave in estado:
+            setattr(utils, chave, estado[chave])
+    if estado.get("chat_id"):
+        chat_destino["id"] = estado["chat_id"]
+    log.info(f"💾 Estado carregado de {STATE_FILE}")
+
+
+def _salvar_estado():
+    estado = {chave: getattr(utils, chave) for chave in _CHAVES_ESTADO}
+    estado["chat_id"] = chat_destino["id"]
+    try:
+        tmp = f"{STATE_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(estado, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.warning(f"⚠️ Não foi possível salvar {STATE_FILE}: {e}")
+
+
 async def _executar_scan() -> tuple[str, int]:
     """Roda o scan numa thread (não bloqueia o bot) e devolve o ranking formatado."""
     resultados = await asyncio.to_thread(
@@ -114,27 +137,6 @@ async def _executar_scan() -> tuple[str, int]:
         score_minimo=utils.SCORE_MINIMO,
     )
     return formatar_ranking(resultados, utils.TIMEFRAME_PADRAO), len(resultados)
-
-
-def _reagendar(app: Application):
-    """Recria o job do scheduler com o intervalo atual."""
-    schedule.clear("radar")
-
-    def job():
-        if _main_loop is None or _main_loop.is_closed():
-            log.error("❌ Loop principal não disponível para o scheduler.")
-            return
-        future = asyncio.run_coroutine_threadsafe(
-            enviar_alerta_automatico(app),
-            _main_loop,
-        )
-        try:
-            future.result(timeout=300)
-        except Exception as e:
-            log.error(f"Erro no job do scheduler: {e}")
-
-    schedule.every(utils.POLL_INTERVAL_MINUTES).minutes.do(job).tag("radar")
-    log.info(f"⏰ Scheduler reagendado → a cada {utils.POLL_INTERVAL_MINUTES} min")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -182,6 +184,7 @@ async def cmd_ajuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_setchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     chat_destino["id"] = chat_id
+    _salvar_estado()
     await update.message.reply_text(
         f"✅ *Chat configurado com sucesso\\!*\n\n"
         f"ID: `{chat_id}`\n"
@@ -261,6 +264,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             antigo = utils.SCORE_MINIMO
             utils.SCORE_MINIMO = novo
+            _salvar_estado()
             log.info(f"SCORE_MINIMO: {antigo} → {novo}")
             dica = (
                 "⚠️ Score baixo → mais alertas, menor qualidade" if novo <= 3
@@ -288,6 +292,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             antigo = utils.TOP_N_MOEDAS
             utils.TOP_N_MOEDAS = novo
+            _salvar_estado()
             log.info(f"TOP_N_MOEDAS: {antigo} → {novo}")
             dica = (
                 "📋 Lista longa → use score alto para filtrar" if novo >= 20
@@ -315,7 +320,8 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             antigo = utils.POLL_INTERVAL_MINUTES
             utils.POLL_INTERVAL_MINUTES = novo
-            _reagendar(ctx.application)
+            _salvar_estado()
+            agendar_radar(ctx.application)
             log.info(f"POLL_INTERVAL_MINUTES: {antigo} → {novo}")
             horas, minutos = divmod(novo, 60)
             if horas > 0 and minutos > 0:
@@ -327,7 +333,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ *Intervalo de scan atualizado\\!*\n\n"
                 f"  Antes: `{antigo} min`\n"
-                f"  Agora: `{novo} min` \\({_escape(tempo_fmt)}\\)\n\n"
+                f"  Agora: `{novo} min` \\({esc(tempo_fmt)}\\)\n\n"
                 f"⏰ Próximo scan automático em `{novo} min`",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
@@ -351,6 +357,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         antigo = utils.TIMEFRAME_PADRAO
         utils.TIMEFRAME_PADRAO = valor_raw
+        _salvar_estado()
         log.info(f"TIMEFRAME_PADRAO: {antigo} → {valor_raw}")
         dicas = {
             "1m":  "⚡ Scalping — muito ruído, use com cuidado",
@@ -365,14 +372,14 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Timeframe atualizado\\!*\n\n"
             f"  Antes: `{antigo}`\n"
             f"  Agora: `{valor_raw}`\n\n"
-            f"{_escape(dicas.get(valor_raw, ''))}",
+            f"{esc(dicas.get(valor_raw, ''))}",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
     # ── desconhecido ──────────────────────────────────────────
     else:
         await update.message.reply_text(
-            f"❌ Parâmetro `{_escape(parametro)}` desconhecido\\.\n\n"
+            f"❌ Parâmetro `{esc(parametro)}` desconhecido\\.\n\n"
             "Parâmetros válidos: `score`, `moedas`, `intervalo`, `timeframe`\n\n"
             "Digite /set para ver o menu completo\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -405,7 +412,7 @@ async def cmd_radar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Erro cmd_radar: {e}")
         await update.message.reply_text(
-            f"❌ Erro ao escanear: `{_escape(str(e))}`",
+            f"❌ Erro ao escanear: `{esc(str(e))}`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
@@ -427,7 +434,7 @@ async def cmd_analise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     timeframe = args[1].lower() if len(args) > 1 else utils.TIMEFRAME_PADRAO
 
     await update.message.reply_text(
-        f"📊 Analisando *{_escape(par)}* no `{timeframe}`\\.\\.\\.",
+        f"📊 Analisando *{esc(par)}* no `{timeframe}`\\.\\.\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
     try:
@@ -440,7 +447,7 @@ async def cmd_analise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Erro cmd_analise {par}: {e}")
         await update.message.reply_text(
-            f"❌ Erro ao analisar `{_escape(par)}`:\n`{_escape(str(e))}`",
+            f"❌ Erro ao analisar `{esc(par)}`:\n`{esc(str(e))}`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
@@ -485,7 +492,7 @@ async def enviar_alerta_automatico(app: Application):
         try:
             kwargs = {
                 "chat_id": cid,
-                "text": f"⚠️ Erro no scan automático: `{_escape(str(e))}`",
+                "text": f"⚠️ Erro no scan automático: `{esc(str(e))}`",
                 "parse_mode": ParseMode.MARKDOWN_V2,
             }
             if MESSAGE_THREAD_ID:
@@ -497,35 +504,20 @@ async def enviar_alerta_automatico(app: Application):
 
 
 # ══════════════════════════════════════════════════════════════
-# SCHEDULER — USA O LOOP DO BOT, SEM CRIAR NOVO
+# SCHEDULER — JobQueue do python-telegram-bot
 # ══════════════════════════════════════════════════════════════
 
-def iniciar_scheduler(app: Application):
-    """Inicia o scheduler em thread separada."""
+async def _job_radar(ctx: ContextTypes.DEFAULT_TYPE):
+    await enviar_alerta_automatico(ctx.application)
 
-    def job():
-        if _main_loop is None or _main_loop.is_closed():
-            log.error("❌ Loop principal fechado — scheduler abortou.")
-            return
-        future = asyncio.run_coroutine_threadsafe(
-            enviar_alerta_automatico(app),
-            _main_loop,
-        )
-        try:
-            future.result(timeout=300)
-        except Exception as e:
-            log.error(f"Erro no job do scheduler: {e}")
 
-    schedule.every(utils.POLL_INTERVAL_MINUTES).minutes.do(job).tag("radar")
-    log.info(f"⏰ Scheduler ativo — scan a cada {utils.POLL_INTERVAL_MINUTES} min")
-
-    def run():
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
+def agendar_radar(app: Application):
+    """(Re)cria o job de scan automático com o intervalo atual."""
+    for job in app.job_queue.get_jobs_by_name("radar"):
+        job.schedule_removal()
+    intervalo = utils.POLL_INTERVAL_MINUTES * 60
+    app.job_queue.run_repeating(_job_radar, interval=intervalo, first=intervalo, name="radar")
+    log.info(f"⏰ Scan automático a cada {utils.POLL_INTERVAL_MINUTES} min")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -533,8 +525,6 @@ def iniciar_scheduler(app: Application):
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    global _main_loop
-
     if not TOKEN_OK:
         print("=" * 55)
         print("❌  TELEGRAM_BOT_TOKEN não configurado!")
@@ -545,6 +535,7 @@ def main():
     log.info(f"🚀 Iniciando Radar Lowcap Bot...{thread_info}")
     if not ADMIN_IDS:
         log.warning("⚠️ ADMIN_IDS não configurado — qualquer usuário pode usar /radar, /set e /setchat.")
+    _carregar_estado()
 
     app = (
         Application.builder()
@@ -561,12 +552,8 @@ def main():
     app.add_handler(CommandHandler("radar",   cmd_radar))
     app.add_handler(CommandHandler("analise", cmd_analise))
 
-    # ── Post-init: captura o loop ANTES do scheduler ──────────
+    # ── Post-init ─────────────────────────────────────────────
     async def post_init(application: Application):
-        global _main_loop
-        _main_loop = asyncio.get_running_loop()
-        log.info(f"✅ Loop principal capturado: {_main_loop}")
-
         await application.bot.set_my_commands([
             BotCommand("start",   "Apresentação do bot"),
             BotCommand("radar",   "Scan manual agora"),
@@ -577,7 +564,7 @@ def main():
             BotCommand("ajuda",   "Lista de comandos"),
         ])
 
-        iniciar_scheduler(application)
+        agendar_radar(application)
         log.info("✅ Bot iniciado com sucesso!")
 
     app.post_init = post_init

@@ -11,6 +11,7 @@ from analysis import (
     lado_da_direcao,
     calcular_setup_trade,
 )
+from formatacao import esc, italic, fmt_price
 from utils import SCORE_MINIMO, TOP_N_MOEDAS, TIMEFRAME_PADRAO, SCAN_WORKERS
 
 log = logging.getLogger(__name__)
@@ -20,37 +21,13 @@ log = logging.getLogger(__name__)
 # HELPERS DE FORMATAÇÃO
 # ══════════════════════════════════════════════════════════════
 
-def _esc(text: str) -> str:
-    """Escapa todos os caracteres especiais do MarkdownV2."""
-    text = str(text)
-    for ch in r"\_*[]()~`>#+-=|{}.!:":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
-def _italic(text: str) -> str:
-    """
-    Envolve texto em itálico MarkdownV2 de forma segura.
-    Escapa o conteúdo interno antes de envolver com _.
-    """
-    return f"_{_esc(str(text))}_"
-
-
 def _formatar_mtf(valor: str) -> str:
     """Converte a string de direção MTF em label curto e limpo."""
     v = str(valor).strip()
     if "ALTA"  in v: return "📈 ALTA"
     if "BAIXA" in v: return "📉 BAIXA"
     if "Erro"  in v or not v or v == "?": return "❓ N/A"
-    return _esc(v[:12])
-
-
-def _fmt_price(price: float) -> str:
-    """Formata preço de acordo com a magnitude."""
-    if price < 0.0001:  return f"{price:.8f}"
-    elif price < 1:     return f"{price:.6f}"
-    elif price < 1000:  return f"{price:.4f}"
-    else:               return f"{price:,.2f}"
+    return esc(v[:12])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -151,7 +128,7 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
 
     linhas = [
         f"🏆 *RADAR LOWCAP — TOP {len(resultados)}*",
-        f"📅 Timeframe\\: `{_esc(timeframe.upper())}` \\| Ciclo atual",
+        f"📅 Timeframe\\: `{esc(timeframe.upper())}` \\| Ciclo atual",
         "━━━━━━━━━━━━━━━━━━━━━━━━\n",
     ]
 
@@ -168,9 +145,9 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
         tags_str = "  ".join(tags)
 
         # ── Preço e variação ──────────────────────────────────
-        price_esc  = _esc(_fmt_price(r["price"]))
+        price_esc  = esc(fmt_price(r["price"]))
         change     = r["change24h"]
-        change_esc = _esc(f"{change:+.2f}%")
+        change_esc = esc(f"{change:+.2f}%")
         c_emoji    = "📈" if change >= 0 else "📉"
 
         # ── MTF ───────────────────────────────────────────────
@@ -179,29 +156,29 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
         mtf_1h = _formatar_mtf(r["mtf"].get("1h", "?"))
 
         # ── Score e classe ────────────────────────────────────
-        score_esc   = _esc(str(r["score"]))
-        classe_esc  = _esc(r["classe"])
-        direcao_esc = _esc(r["direcao"])
-        rsi_esc     = _esc(str(r["rsi"]))
-        vol_esc     = _esc(f"{r['vol_ratio']}x")
+        score_esc   = esc(str(r["score"]))
+        classe_esc  = esc(r["classe"])
+        direcao_esc = esc(r["direcao"])
+        rsi_esc     = esc(str(r["rsi"]))
+        vol_esc     = esc(f"{r['vol_ratio']}x")
 
         # ── Bloco do setup de trade ───────────────────────────
         if st and st.get("valido"):
             lado      = "🟢 LONG" if st["lado"] == "long" else "🔴 SHORT"
-            entrada   = _esc(_fmt_price(st["entrada"]))
-            sl        = _esc(_fmt_price(st["sl"]))
-            tp1       = _esc(_fmt_price(st["tp1"]))
-            tp2       = _esc(_fmt_price(st["tp2"]))
-            tp3       = _esc(_fmt_price(st["tp3"]))
-            rr        = _esc(f"{st['rr']:.1f}")
-            risco_pct = _esc(f"{st['risco_pct']:.2f}%")
+            entrada   = esc(fmt_price(st["entrada"]))
+            sl        = esc(fmt_price(st["sl"]))
+            tp1       = esc(fmt_price(st["tp1"]))
+            tp2       = esc(fmt_price(st["tp2"]))
+            tp3       = esc(fmt_price(st["tp3"]))
+            rr        = esc(f"{st['rr']:.1f}")
+            risco_pct = esc(f"{st['risco_pct']:.2f}%")
 
-            # ✅ sl_tipo isolado na função _italic() — seguro para qualquer conteúdo
-            sl_tipo_fmt = _italic(st.get("sl_tipo", "estrutural"))
+            # ✅ sl_tipo isolado na função italic() — seguro para qualquer conteúdo
+            sl_tipo_fmt = italic(st.get("sl_tipo", "estrutural"))
 
             avisos_txt = ""
             for aviso in st.get("avisos", []):
-                avisos_txt += f"  ├ {_esc(str(aviso))}\n"
+                avisos_txt += f"  ├ {esc(str(aviso))}\n"
 
             trade_bloco = (
                 f"\n  ┌─ {lado} ─ R\\:R `1:{rr}`\n"
@@ -215,12 +192,12 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
             )
         else:
             motivo      = st.get("motivo", "setup inválido") if st else "não calculado"
-            # ✅ motivo dinâmico isolado dentro do _italic() — nunca quebra o itálico
-            trade_bloco = f"\n  ⚠️ {_italic('Sem setup: ' + motivo)}\n"
+            # ✅ motivo dinâmico isolado dentro do italic() — nunca quebra o itálico
+            trade_bloco = f"\n  ⚠️ {italic('Sem setup: ' + motivo)}\n"
 
         # ── Bloco completo da moeda ───────────────────────────
-        symbol_esc   = _esc(r["symbol"])
-        exchange_esc = _esc(r["exchange"].upper())
+        symbol_esc   = esc(r["symbol"])
+        exchange_esc = esc(r["exchange"].upper())
 
         bloco = (
             f"{medal} *{symbol_esc}* \\({exchange_esc}\\)"
