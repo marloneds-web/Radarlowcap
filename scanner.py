@@ -1,39 +1,25 @@
-# scanner.py — COMPLETO E CORRIGIDO
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ta
-import numpy as np
 from exchanges import obter_candles, listar_lowcaps
 from strategy import calcular_score_final, classificar_setup, calcular_squeeze_pro
 from analysis import (
     avaliar_tendencia,
     analise_multi_timeframe,
+    confluencia_mtf,
+    lado_da_direcao,
     calcular_setup_trade,
-    calcular_fibonacci,
-    _swing_points,
-    _detectar_fvg,
 )
-from utils import SCORE_MINIMO, TOP_N_MOEDAS, TIMEFRAME_PADRAO
+from formatacao import esc, italic, fmt_price
+from utils import SCORE_MINIMO, TOP_N_MOEDAS, TIMEFRAME_PADRAO, SCAN_WORKERS
+
+log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════
 # HELPERS DE FORMATAÇÃO
 # ══════════════════════════════════════════════════════════════
-
-def _esc(text: str) -> str:
-    """Escapa todos os caracteres especiais do MarkdownV2."""
-    text = str(text)
-    for ch in r"\_*[]()~`>#+-=|{}.!:":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
-def _italic(text: str) -> str:
-    """
-    Envolve texto em itálico MarkdownV2 de forma segura.
-    Escapa o conteúdo interno antes de envolver com _.
-    """
-    return f"_{_esc(str(text))}_"
-
 
 def _formatar_mtf(valor: str) -> str:
     """Converte a string de direção MTF em label curto e limpo."""
@@ -41,77 +27,94 @@ def _formatar_mtf(valor: str) -> str:
     if "ALTA"  in v: return "📈 ALTA"
     if "BAIXA" in v: return "📉 BAIXA"
     if "Erro"  in v or not v or v == "?": return "❓ N/A"
-    return _esc(v[:12])
-
-
-def _fmt_price(price: float) -> str:
-    """Formata preço de acordo com a magnitude."""
-    if price < 0.0001:  return f"{price:.8f}"
-    elif price < 1:     return f"{price:.6f}"
-    elif price < 1000:  return f"{price:.4f}"
-    else:               return f"{price:,.2f}"
+    return esc(v[:12])
 
 
 # ══════════════════════════════════════════════════════════════
 # SCAN PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
+def _analisar_moeda(m: dict, timeframe: str, score_minimo: int):
+    """Analisa uma moeda; retorna o dict do resultado ou None se não passar no score."""
+    par = m["symbol"]
+    df  = obter_candles(par, timeframe, limit=300, preferida=m["exchange"])
+    if df is None or len(df) < 100:
+        return None
+
+    direcao, _, _ = avaliar_tendencia(df)
+    lado          = lado_da_direcao(direcao)
+
+    # A confluência MTF vale no máximo 1 ponto: se nem com ela a moeda chega
+    # ao score mínimo, poupa as 3 requisições extras do multi-timeframe.
+    score, _, _ = calcular_score_final(df, par, 3, lado)
+    if score < score_minimo:
+        return None
+
+    mtf, _ = analise_multi_timeframe(par, preferida=m["exchange"])
+    score, breakdown, fase_amd = calcular_score_final(
+        df, par, confluencia_mtf(mtf, lado), lado
+    )
+    if score < score_minimo:
+        return None
+
+    sq        = calcular_squeeze_pro(df)
+    rsi       = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
+    vol_ma21  = df["volume"].rolling(21).mean().iloc[-1]
+    vol_ratio = df["volume"].iloc[-1] / vol_ma21 if vol_ma21 > 0 else 0
+    classe, classe_desc = classificar_setup(score, fase_amd, lado)
+
+    return {
+        "symbol":      par,
+        "exchange":    m["exchange"],
+        "score":       score,
+        "classe":      classe,
+        "classe_desc": classe_desc,
+        "direcao":     direcao,
+        "fase_amd":    fase_amd,
+        "squeeze":     sq["estado"],
+        "rsi":         round(rsi, 2),
+        "vol_ratio":   round(vol_ratio, 2),
+        "change24h":   m["change24h"],
+        "price":       m["price"],
+        "breakdown":   breakdown,
+        "mtf":         mtf,
+        "setup_trade": calcular_setup_trade(df, direcao, mtf=mtf),
+    }
+
+
 def escanear_lowcaps(
     top_n=TOP_N_MOEDAS,
     timeframe=TIMEFRAME_PADRAO,
-    score_minimo=SCORE_MINIMO
+    score_minimo=SCORE_MINIMO,
+    workers=SCAN_WORKERS,
 ) -> list:
-    moedas  = listar_lowcaps()
-    total   = len(moedas)
+    moedas     = listar_lowcaps()
+    total      = len(moedas)
     resultados = []
-    print(f"🔍 Escaneando {total} lowcaps no timeframe {timeframe}...")
+    falhas     = 0
+    log.info(f"🔍 Escaneando {total} lowcaps no timeframe {timeframe} ({workers} workers)...")
 
-    for i, m in enumerate(moedas, 1):
-        par = m["symbol"]
-        try:
-            df = obter_candles(par, timeframe, limit=300)
-            if df is None or len(df) < 100:
-                continue
-
-            mtf, confluencia            = analise_multi_timeframe(par)
-            score, breakdown, fase_amd  = calcular_score_final(df, par, confluencia)
-            direcao, _, _               = avaliar_tendencia(df)
-            sq                          = calcular_squeeze_pro(df)
-            rsi      = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
-            vol_ma21 = df["volume"].rolling(21).mean().iloc[-1]
-            vol_ratio = df["volume"].iloc[-1] / vol_ma21 if vol_ma21 > 0 else 0
-            classe, classe_desc = classificar_setup(
-                score, fase_amd, sq["estado"], vol_ratio
-            )
-            setup_trade = calcular_setup_trade(df, direcao, mtf=mtf)
-
-            if score >= score_minimo:
-                resultados.append({
-                    "symbol":      par,
-                    "exchange":    m["exchange"],
-                    "score":       score,
-                    "classe":      classe,
-                    "classe_desc": classe_desc,
-                    "direcao":     direcao,
-                    "fase_amd":    fase_amd,
-                    "squeeze":     sq["estado"],
-                    "rsi":         round(rsi, 2),
-                    "vol_ratio":   round(vol_ratio, 2),
-                    "change24h":   m["change24h"],
-                    "price":       m["price"],
-                    "breakdown":   breakdown,
-                    "mtf":         mtf,
-                    "setup_trade": setup_trade,
-                })
-
-            if i % 20 == 0:
-                print(f"  ⏳ {i}/{total} processados...")
-
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futuros = {
+            pool.submit(_analisar_moeda, m, timeframe, score_minimo): m["symbol"]
+            for m in moedas
+        }
+        for i, fut in enumerate(as_completed(futuros), 1):
+            try:
+                r = fut.result()
+                if r:
+                    resultados.append(r)
+            except Exception as e:
+                falhas += 1
+                log.debug(f"Falha ao analisar {futuros[fut]}: {e}")
+            if i % 50 == 0:
+                log.info(f"  ⏳ {i}/{total} processados...")
 
     resultados.sort(key=lambda x: x["score"], reverse=True)
-    print(f"✅ Scan completo. {len(resultados)} moedas com score ≥ {score_minimo}.")
+    log.info(
+        f"✅ Scan completo. {len(resultados)} moedas com score ≥ {score_minimo} "
+        f"({falhas} falhas de dados)."
+    )
     return resultados[:top_n]
 
 
@@ -125,7 +128,7 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
 
     linhas = [
         f"🏆 *RADAR LOWCAP — TOP {len(resultados)}*",
-        f"📅 Timeframe\\: `{_esc(timeframe.upper())}` \\| Ciclo atual",
+        f"📅 Timeframe\\: `{esc(timeframe.upper())}` \\| Ciclo atual",
         "━━━━━━━━━━━━━━━━━━━━━━━━\n",
     ]
 
@@ -142,9 +145,9 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
         tags_str = "  ".join(tags)
 
         # ── Preço e variação ──────────────────────────────────
-        price_esc  = _esc(_fmt_price(r["price"]))
+        price_esc  = esc(fmt_price(r["price"]))
         change     = r["change24h"]
-        change_esc = _esc(f"{change:+.2f}%")
+        change_esc = esc(f"{change:+.2f}%")
         c_emoji    = "📈" if change >= 0 else "📉"
 
         # ── MTF ───────────────────────────────────────────────
@@ -153,29 +156,29 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
         mtf_1h = _formatar_mtf(r["mtf"].get("1h", "?"))
 
         # ── Score e classe ────────────────────────────────────
-        score_esc   = _esc(str(r["score"]))
-        classe_esc  = _esc(r["classe"])
-        direcao_esc = _esc(r["direcao"])
-        rsi_esc     = _esc(str(r["rsi"]))
-        vol_esc     = _esc(f"{r['vol_ratio']}x")
+        score_esc   = esc(str(r["score"]))
+        classe_esc  = esc(r["classe"])
+        direcao_esc = esc(r["direcao"])
+        rsi_esc     = esc(str(r["rsi"]))
+        vol_esc     = esc(f"{r['vol_ratio']}x")
 
         # ── Bloco do setup de trade ───────────────────────────
         if st and st.get("valido"):
             lado      = "🟢 LONG" if st["lado"] == "long" else "🔴 SHORT"
-            entrada   = _esc(_fmt_price(st["entrada"]))
-            sl        = _esc(_fmt_price(st["sl"]))
-            tp1       = _esc(_fmt_price(st["tp1"]))
-            tp2       = _esc(_fmt_price(st["tp2"]))
-            tp3       = _esc(_fmt_price(st["tp3"]))
-            rr        = _esc(f"{st['rr']:.1f}")
-            risco_pct = _esc(f"{st['risco_pct']:.2f}%")
+            entrada   = esc(fmt_price(st["entrada"]))
+            sl        = esc(fmt_price(st["sl"]))
+            tp1       = esc(fmt_price(st["tp1"]))
+            tp2       = esc(fmt_price(st["tp2"]))
+            tp3       = esc(fmt_price(st["tp3"]))
+            rr        = esc(f"{st['rr']:.1f}")
+            risco_pct = esc(f"{st['risco_pct']:.2f}%")
 
-            # ✅ sl_tipo isolado na função _italic() — seguro para qualquer conteúdo
-            sl_tipo_fmt = _italic(st.get("sl_tipo", "estrutural"))
+            # ✅ sl_tipo isolado na função italic() — seguro para qualquer conteúdo
+            sl_tipo_fmt = italic(st.get("sl_tipo", "estrutural"))
 
             avisos_txt = ""
             for aviso in st.get("avisos", []):
-                avisos_txt += f"  ├ {_esc(str(aviso))}\n"
+                avisos_txt += f"  ├ {esc(str(aviso))}\n"
 
             trade_bloco = (
                 f"\n  ┌─ {lado} ─ R\\:R `1:{rr}`\n"
@@ -189,12 +192,12 @@ def formatar_ranking(resultados: list, timeframe: str) -> str:
             )
         else:
             motivo      = st.get("motivo", "setup inválido") if st else "não calculado"
-            # ✅ motivo dinâmico isolado dentro do _italic() — nunca quebra o itálico
-            trade_bloco = f"\n  ⚠️ {_italic('Sem setup: ' + motivo)}\n"
+            # ✅ motivo dinâmico isolado dentro do italic() — nunca quebra o itálico
+            trade_bloco = f"\n  ⚠️ {italic('Sem setup: ' + motivo)}\n"
 
         # ── Bloco completo da moeda ───────────────────────────
-        symbol_esc   = _esc(r["symbol"])
-        exchange_esc = _esc(r["exchange"].upper())
+        symbol_esc   = esc(r["symbol"])
+        exchange_esc = esc(r["exchange"].upper())
 
         bloco = (
             f"{medal} *{symbol_esc}* \\({exchange_esc}\\)"

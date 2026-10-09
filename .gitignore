@@ -1,1 +1,16 @@
-#
+# Segredos
+.env
+
+# Estado persistido em runtime
+state.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+# Sistema
+.DS_Store
+*.log

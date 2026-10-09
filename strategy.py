@@ -185,37 +185,6 @@ def detectar_padroes_candle(df: pd.DataFrame) -> list:
 
 
 # ══════════════════════════════════════════════════════════════
-# DETECTAR DIVERGÊNCIAS RSI
-# ══════════════════════════════════════════════════════════════
-
-def detectar_divergencia_rsi(df: pd.DataFrame) -> str:
-    """
-    Alta: preço faz fundo mais baixo, RSI faz fundo mais alto → compra
-    Baixa: preço faz topo mais alto, RSI faz topo mais baixo → venda
-    """
-    try:
-        rsi   = ta.momentum.RSIIndicator(df["close"], 14).rsi()
-        close = df["close"]
-
-        # Compara últimos 2 fundos / topos (janela de 20 candles)
-        janela = 20
-        c20   = close.tail(janela).values
-        r20   = rsi.tail(janela).values
-
-        # Divergência de alta
-        if c20[-1] < c20[0] and r20[-1] > r20[0]:
-            return "📈 Divergência de ALTA no RSI"
-
-        # Divergência de baixa
-        if c20[-1] > c20[0] and r20[-1] < r20[0]:
-            return "📉 Divergência de BAIXA no RSI"
-
-        return "Sem divergência"
-    except Exception:
-        return "Sem divergência"
-
-
-# ══════════════════════════════════════════════════════════════
 # DETECTAR ZONAS DE FIBONACCI
 # ══════════════════════════════════════════════════════════════
 
@@ -260,11 +229,14 @@ def calcular_score_final(
     df: pd.DataFrame,
     symbol: str = "",
     confluencia_mtf: int = 0,
+    lado: str = "long",
 ) -> tuple:
     """
-    Calcula score de 0 a 10 para o setup.
+    Calcula score de 0 a 10 para o setup na direção `lado` ("long" ou "short").
+    `confluencia_mtf` = nº de timeframes alinhados com essa direção.
     Retorna: (score, breakdown[], fase_amd)
     """
+    short = lado == "short"
     score     = 0
     breakdown = []
 
@@ -280,17 +252,24 @@ def calcular_score_final(
     preco = close.iloc[-1]
 
     pts_tend = 0
-    if preco > ema21.iloc[-1]:
-        pts_tend += 1
-    if ema9.iloc[-1] > ema21.iloc[-1] and ema21.iloc[-1] > ema50.iloc[-1]:
-        pts_tend += 1
+    if short:
+        if preco < ema21.iloc[-1]:
+            pts_tend += 1
+        if ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]:
+            pts_tend += 1
+    else:
+        if preco > ema21.iloc[-1]:
+            pts_tend += 1
+        if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]:
+            pts_tend += 1
     score += pts_tend
     breakdown.append(f"  {'✅' if pts_tend == 2 else '⚡' if pts_tend == 1 else '❌'} "
                      f"Tendência EMA: {pts_tend}/2 pts")
 
     # ── 2. RSI ────────────────────────────────────────────── (0-1 pt)
     rsi_val = ta.momentum.RSIIndicator(close, 14).rsi().iloc[-1]
-    pts_rsi = 1 if 40 <= rsi_val <= 70 else 0
+    # Zona de momentum saudável na direção, sem extremos
+    pts_rsi = 1 if (30 <= rsi_val <= 60 if short else 40 <= rsi_val <= 70) else 0
     score  += pts_rsi
     breakdown.append(f"  {'✅' if pts_rsi else '❌'} "
                      f"RSI ({rsi_val:.1f}): {pts_rsi}/1 pt")
@@ -301,7 +280,10 @@ def calcular_score_final(
     macd_sig   = macd_obj.macd_signal().iloc[-1]
     macd_hist  = macd_obj.macd_diff().iloc[-1]
     macd_ant   = macd_obj.macd_diff().iloc[-2]
-    pts_macd   = 1 if (macd_val > macd_sig and macd_hist > macd_ant) else 0
+    if short:
+        pts_macd = 1 if (macd_val < macd_sig and macd_hist < macd_ant) else 0
+    else:
+        pts_macd = 1 if (macd_val > macd_sig and macd_hist > macd_ant) else 0
     score     += pts_macd
     breakdown.append(f"  {'✅' if pts_macd else '❌'} "
                      f"MACD cruzando: {pts_macd}/1 pt")
@@ -332,7 +314,9 @@ def calcular_score_final(
                      f"Confluência MTF ({confluencia_mtf}/3): {pts_mtf}/1 pt")
 
     # ── 7. PADRÕES DE CANDLE ──────────────────────────────── (0-1 pt)
-    padroes  = detectar_padroes_candle(df)
+    # Ignora padrões que apontam contra a direção do setup
+    contrario = "Alta" if short else "Baixa"
+    padroes  = [p for p in detectar_padroes_candle(df) if contrario not in p]
     pts_cand = 1 if len(padroes) > 0 else 0
     score   += pts_cand
     breakdown.append(f"  {'✅' if pts_cand else '❌'} "
@@ -366,28 +350,21 @@ def calcular_score_final(
 def classificar_setup(
     score: int,
     fase_amd: str,
-    squeeze_estado: str,
-    vol_ratio: float,
+    lado: str = "long",
 ) -> tuple:
     """
     Classifica o setup em categorias com descrição.
+    Squeeze e volume já entram no score; aqui só a fase AMD vira bônus
+    (acumulação favorece long, distribuição favorece short).
     Retorna: (classe, descricao)
     """
-    # Bônus por contexto
-    bonus = 0
-    if fase_amd == "acumulacao":
-        bonus += 1
-    if squeeze_estado == "LIBERADO":
-        bonus += 1
-    if vol_ratio >= 2.0:
-        bonus += 1
-
-    score_efetivo = score + bonus
+    fase_favoravel = "distribuicao" if lado == "short" else "acumulacao"
+    score_efetivo  = score + (1 if fase_amd == fase_favoravel else 0)
 
     if score_efetivo >= 9:
         return (
             "🔥 SETUP A+ — ALTÍSSIMA PROBABILIDADE",
-            "Squeeze liberado + acumulação + volume confirmando"
+            "Confluência máxima de indicadores + fase AMD favorável"
         )
     elif score_efetivo >= 7:
         return (

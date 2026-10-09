@@ -2,40 +2,12 @@ import pandas as pd
 import numpy as np
 import ta
 from exchanges import obter_candles
+from formatacao import esc, fmt_price
 
 
 # ══════════════════════════════════════════════════════════════
 # HELPERS DE ESCAPE — MarkdownV2
 # ══════════════════════════════════════════════════════════════
-
-def _e(text) -> str:
-    """Escapa TODOS os caracteres reservados do MarkdownV2."""
-    text = str(text)
-    for ch in r"\_*[]()~`>#+-=|{}.!:":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
-def _c(text) -> str:
-    """Envolve em bloco de código inline (não precisa escapar dentro)."""
-    return f"`{text}`"
-
-
-def _b(text) -> str:
-    """Negrito seguro."""
-    return f"*{_e(str(text))}*"
-
-
-def _i(text) -> str:
-    """
-    Itálico seguro — escapa tudo EXCETO underscore,
-    que é o delimitador do itálico no MarkdownV2.
-    """
-    inner = str(text)
-    for ch in r"\*[]()~`>#+-=|{}.!:":
-        inner = inner.replace(ch, f"\\{ch}")
-    return f"_{inner}_"
-
 
 def _safe(text) -> str:
     """
@@ -112,23 +84,28 @@ def calcular_fibonacci(df: pd.DataFrame, janela: int = 50):
 
 
 def _golden_pocket(fib_ret: dict) -> tuple:
-    """Retorna a zona Golden Pocket (61.8% ~ 65%)."""
-    return fib_ret.get("61.8%", 0), fib_ret.get("65%", 0)
+    """
+    Retorna a zona Golden Pocket (61.8% ~ 65%) como (limite_inferior, limite_superior).
+    Como as retrações são medidas a partir do topo, o nível 65% fica ABAIXO do 61.8%.
+    """
+    a, b = fib_ret.get("61.8%", 0), fib_ret.get("65%", 0)
+    return min(a, b), max(a, b)
 
 
 def _nivel_fib_mais_proximo(preco: float, fib_ret: dict, tolerancia_pct: float = 1.5):
     """
-    Verifica se o preço está próximo de algum nível Fib.
-    Retorna (nivel_nome, nivel_valor) ou (None, None).
+    Retorna o nível Fib mais próximo do preço, se estiver dentro da tolerância:
+    (nivel_nome, nivel_valor) ou (None, None).
     Boroden: 3-4 ticks de tolerância → usamos % do preço.
     """
-    for nome, valor in fib_ret.items():
-        if valor == 0:
-            continue
-        dist_pct = abs(preco - valor) / preco * 100
-        if dist_pct <= tolerancia_pct:
-            return nome, valor
-    return None, None
+    candidatos = [
+        (abs(preco - valor) / preco * 100, nome, valor)
+        for nome, valor in fib_ret.items() if valor
+    ]
+    if not candidatos:
+        return None, None
+    dist_pct, nome, valor = min(candidatos)
+    return (nome, valor) if dist_pct <= tolerancia_pct else (None, None)
 
 
 def _projecao_alternada(swing_a: float, swing_b: float,
@@ -173,19 +150,16 @@ def _swing_points(df: pd.DataFrame, janela: int = 5):
 # ══════════════════════════════════════════════════════════════
 
 def _detectar_fvg(df: pd.DataFrame, lado: str = "long") -> list:
-    fvgs = []
-    for i in range(2, len(df)):
-        if lado == "long":
-            gap_low  = df["low"].iloc[i]
-            gap_high = df["high"].iloc[i - 2]
-            if gap_low > gap_high:
-                fvgs.append((gap_high + gap_low) / 2)
-        else:
-            gap_high = df["high"].iloc[i]
-            gap_low  = df["low"].iloc[i - 2]
-            if gap_high < gap_low:
-                fvgs.append((gap_high + gap_low) / 2)
-    return fvgs[-3:] if fvgs else []
+    """Pontos médios dos 3 Fair Value Gaps mais recentes."""
+    high_2 = df["high"].shift(2)
+    low_2  = df["low"].shift(2)
+    if lado == "long":
+        mask = df["low"] > high_2
+        meio = (high_2 + df["low"]) / 2
+    else:
+        mask = df["high"] < low_2
+        meio = (df["high"] + low_2) / 2
+    return meio[mask].tail(3).tolist()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -220,17 +194,28 @@ def avaliar_tendencia(df: pd.DataFrame):
 # MULTI-TIMEFRAME
 # ══════════════════════════════════════════════════════════════
 
-def analise_multi_timeframe(par: str, timeframes: tuple = ("1d", "4h", "1h")):
+def analise_multi_timeframe(par: str, timeframes: tuple = ("1d", "4h", "1h"),
+                            preferida: str = None):
     resultados = {}
     for tf in timeframes:
         try:
-            df = obter_candles(par, tf, limit=200)
+            df = obter_candles(par, tf, limit=200, preferida=preferida)
             direcao, _, _ = avaliar_tendencia(df)
             resultados[tf] = direcao
         except Exception as e:
             resultados[tf] = f"Erro: {str(e)[:20]}"
-    confluencia = sum(1 for v in resultados.values() if "ALTA" in v)
+    confluencia = confluencia_mtf(resultados, "long")
     return resultados, confluencia
+
+
+def lado_da_direcao(direcao: str) -> str:
+    return "long" if "ALTA" in direcao else "short"
+
+
+def confluencia_mtf(mtf: dict, lado: str) -> int:
+    """Quantos timeframes estão alinhados com o lado do setup."""
+    alvo = "ALTA" if lado == "long" else "BAIXA"
+    return sum(1 for v in mtf.values() if alvo in str(v))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -253,7 +238,7 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
         rsi   = ta.momentum.RSIIndicator(df["close"], 14).rsi().iloc[-1]
 
         swing_highs, swing_lows = _swing_points(df, janela=5)
-        lado = "long" if "ALTA" in direcao else "short"
+        lado = lado_da_direcao(direcao)
 
         # ── Filtros RSI ──────────────────────────────────────────
         if lado == "long"  and rsi > 70:
@@ -266,9 +251,9 @@ def calcular_setup_trade(df: pd.DataFrame, direcao: str, mtf: dict = None) -> di
         golden_low, golden_high    = _golden_pocket(fib_ret)
 
         # Verifica se preço está no Golden Pocket
-        em_golden_pocket = (
+        em_golden_pocket = bool(
             golden_low and golden_high
-            and golden_low <= preco <= golden_high * 1.005
+            and golden_low * 0.995 <= preco <= golden_high * 1.005
         )
 
         # Nível Fib mais próximo
@@ -499,44 +484,43 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
     ).average_true_range()
 
     df["vol_ma21"] = df["volume"].rolling(21).mean()
-    vol_ratio      = df["volume"].iloc[-1] / df["vol_ma21"].iloc[-1]
+    vol_ma21_ult   = df["vol_ma21"].iloc[-1]
+    vol_ratio      = df["volume"].iloc[-1] / vol_ma21_ult if vol_ma21_ult > 0 else 0
     vol_forca      = "Alta 🔥" if vol_ratio > 1 else "Baixa"
 
     fib_ret, fib_exp, fib_meta     = calcular_fibonacci(df)
     direcao, crit_det, _           = avaliar_tendencia(df)
-    mtf, confluencia               = analise_multi_timeframe(par)
+    mtf, _                         = analise_multi_timeframe(par)
+    lado                           = lado_da_direcao(direcao)
 
     sq                             = calcular_squeeze_pro(df)
-    score, breakdown, fase_amd     = calcular_score_final(df, par, confluencia)
-    classe, classe_desc            = classificar_setup(score, fase_amd, sq["estado"], vol_ratio)
+    score, breakdown, fase_amd     = calcular_score_final(
+        df, par, confluencia_mtf(mtf, lado), lado
+    )
+    classe, classe_desc            = classificar_setup(score, fase_amd, lado)
     liquidacoes                    = obter_liquidacoes(par)
 
     st = calcular_setup_trade(df, direcao, mtf=mtf)
 
     # ── Helpers locais de formatação numérica ─────────────────
     def _fp(v) -> str:
-        f = float(v)
-        if f < 0.0001:   s = f"{f:.8f}"
-        elif f < 1:      s = f"{f:.6f}"
-        elif f < 1000:   s = f"{f:.4f}"
-        else:            s = f"{f:,.2f}"
-        return f"`{s}`"
+        return f"`{fmt_price(v)}`"
 
     def _fn(v, decimais=2) -> str:
-        return _e(f"{float(v):.{decimais}f}")
+        return esc(f"{float(v):.{decimais}f}")
 
     # ── Bloco de setup ────────────────────────────────────────
     if st.get("valido"):
         lado_label = "🟢 LONG" if st["lado"] == "long" else "🔴 SHORT"
-        rr_esc     = _e(str(st["rr"]))
-        risco_esc  = _e(f"{st['risco_pct']}%")
-        sl_tipo_e  = _e(_safe(st["sl_tipo"]))
+        rr_esc     = esc(str(st["rr"]))
+        risco_esc  = esc(f"{st['risco_pct']}%")
+        sl_tipo_e  = esc(_safe(st["sl_tipo"]))
         gp_badge   = " ⭐ _Golden Pocket_" if st.get("em_golden_pocket") else ""
-        fib_badge  = f" \\({_e(st['nivel_fib'])}\\)" if st.get("nivel_fib") and st["nivel_fib"] != "—" else ""
+        fib_badge  = f" \\({esc(st['nivel_fib'])}\\)" if st.get("nivel_fib") and st["nivel_fib"] != "—" else ""
 
         avisos_linhas = ""
         for av in st.get("avisos", []):
-            avisos_linhas += f"  ⚠️ {_e(_safe(str(av)))}\n"
+            avisos_linhas += f"  ⚠️ {esc(_safe(str(av)))}\n"
 
         setup_txt = (
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -551,7 +535,7 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
             + f"  💡 Apos TP1\\: mover SL para entrada \\(breakeven\\)\n"
         )
     else:
-        motivo_e  = _e(_safe(st.get("motivo", "nao identificado")))
+        motivo_e  = esc(_safe(st.get("motivo", "nao identificado")))
         setup_txt = (
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️ *SETUP:* {motivo_e}\n"
@@ -565,29 +549,28 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
     )
 
     # ── MTF ───────────────────────────────────────────────────
-    mtf_1d = _e(_safe(mtf.get("1d", "N/A")))
-    mtf_4h = _e(_safe(mtf.get("4h", "N/A")))
-    mtf_1h = _e(_safe(mtf.get("1h", "N/A")))
+    mtf_1d = esc(_safe(mtf.get("1d", "N/A")))
+    mtf_4h = esc(_safe(mtf.get("4h", "N/A")))
+    mtf_1h = esc(_safe(mtf.get("1h", "N/A")))
 
     # ── Squeeze ────────────────────────────────────────────────
     sq_emoji = sq.get("emoji", "")
-    sq_msg   = _e(_safe(sq.get("msg", "")))
-    sq_mom   = _e(_safe(str(sq.get("momentum", ""))))
+    sq_msg   = esc(_safe(sq.get("msg", "")))
+    sq_mom   = esc(_safe(str(sq.get("momentum", ""))))
     sq_seta  = "↑" if sq.get("crescendo") else "↓"
 
     # ── Breakdown ─────────────────────────────────────────────
-    breakdown_txt = "\n".join(_e(_safe(str(b))) for b in breakdown)
+    breakdown_txt = "\n".join(esc(_safe(str(b))) for b in breakdown)
 
     # ── Critérios tendência ────────────────────────────────────
-    crit_det_esc = _e(_safe(crit_det))
+    crit_det_esc = esc(_safe(crit_det))
 
     # ── Fibonacci — retrações + Golden Pocket ─────────────────
     fib_linhas = "\n".join(
-        f"  {_e(k)}\\: {_fp(v)}" for k, v in fib_ret.items()
+        f"  {esc(k)}\\: {_fp(v)}" for k, v in fib_ret.items()
     )
 
-    gp_low  = fib_ret.get("61.8%", 0)
-    gp_high = fib_ret.get("65%",   0)
+    gp_low, gp_high = _golden_pocket(fib_ret)
     gp_txt  = (
         f"  🎯 Golden Pocket\\: {_fp(gp_low)} \\— {_fp(gp_high)}\n"
         if gp_low and gp_high else ""
@@ -595,25 +578,25 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
 
     # ── Extensões Fib ──────────────────────────────────────────
     ext_linhas = "\n".join(
-        f"  {_e(k)}\\: {_fp(v)}"
+        f"  {esc(k)}\\: {_fp(v)}"
         for k, v in fib_exp.items()
         if not k.startswith("ext_")   # mostra só as de cima
     )
 
     # ── Liquidações ────────────────────────────────────────────
-    liq_esc = _e(_safe(str(liquidacoes)))
+    liq_esc = esc(_safe(str(liquidacoes)))
 
     # ── Classe / descrição ─────────────────────────────────────
-    classe_e      = _e(_safe(classe))
-    classe_desc_e = _e(_safe(classe_desc))
-    direcao_e     = _e(_safe(direcao))
-    vol_forca_e   = _e(_safe(vol_forca))
+    classe_e      = esc(_safe(classe))
+    classe_desc_e = esc(_safe(classe_desc))
+    direcao_e     = esc(_safe(direcao))
+    vol_forca_e   = esc(_safe(vol_forca))
 
     relatorio = (
-        f"📊 *{_e(par)}* \\| `{_e(timeframe.upper())}`\n"
+        f"📊 *{esc(par)}* \\| `{esc(timeframe.upper())}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"{score_emoji} *SCORE\\: {_e(str(score))}/10* \\— {classe_e}\n"
+        f"{score_emoji} *SCORE\\: {esc(str(score))}/10* \\— {classe_e}\n"
         f"{classe_desc_e}\n\n"
         f"{breakdown_txt}\n\n"
 
@@ -629,7 +612,7 @@ def gerar_relatorio_completo(par: str = "BTCUSDT", timeframe: str = "1h") -> str
 
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *SQUEEZE\\:* {sq_emoji} {sq_msg}\n"
-        f"  Momentum\\: {sq_mom} {_e(sq_seta)}\n\n"
+        f"  Momentum\\: {sq_mom} {esc(sq_seta)}\n\n"
 
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *MEDIAS MOVEIS\\:*\n"

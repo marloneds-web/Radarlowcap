@@ -7,7 +7,7 @@ import json
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from utils import MIN_VOL_24H
+from utils import MIN_VOL_24H, MCAP_MIN, MCAP_MAX, COINGECKO_BASE, COINGECKO_API_KEY
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +23,11 @@ except ImportError:
     )
 
 TIMEOUT = 10
+
+# Sessão HTTP compartilhada: reaproveita conexões TCP/TLS entre requisições
+# (o scan faz centenas de chamadas às mesmas exchanges).
+_http = requests.Session()
+_http.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=32))
 
 TIMEFRAME_MAP = {
     "bitget": {
@@ -61,7 +66,7 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
 def bitget_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
     tf  = TIMEFRAME_MAP["bitget"].get(timeframe, "1H")
     url = f"{BITGET_BASE}/api/v2/spot/market/candles"
-    r   = requests.get(url, params={"symbol":symbol,"granularity":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
+    r   = _http.get(url, params={"symbol":symbol,"granularity":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != "00000" or not data.get("data"):
@@ -72,7 +77,7 @@ def bitget_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
 
 
 def bitget_tickers() -> list:
-    r = requests.get(f"{BITGET_BASE}/api/v2/spot/market/tickers", timeout=TIMEOUT)
+    r = _http.get(f"{BITGET_BASE}/api/v2/spot/market/tickers", timeout=TIMEOUT)
     r.raise_for_status()
     d = r.json()
     if d.get("code") != "00000":
@@ -87,7 +92,7 @@ def bingx_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
     sym = symbol.replace("USDT","-USDT").replace("--","-")
     tf  = TIMEFRAME_MAP["bingx"].get(timeframe, "1h")
     url = f"{BINGX_BASE}/openApi/spot/v2/market/kline"
-    r   = requests.get(url, params={"symbol":sym,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
+    r   = _http.get(url, params={"symbol":sym,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != 0 or not data.get("data"):
@@ -99,7 +104,7 @@ def bingx_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
 
 
 def bingx_tickers() -> list:
-    r = requests.get(f"{BINGX_BASE}/openApi/spot/v1/ticker/24hr", timeout=TIMEOUT)
+    r = _http.get(f"{BINGX_BASE}/openApi/spot/v1/ticker/24hr", timeout=TIMEOUT)
     r.raise_for_status()
     d = r.json()
     if d.get("code") != 0:
@@ -113,7 +118,7 @@ def bingx_tickers() -> list:
 def mexc_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
     tf  = TIMEFRAME_MAP["mexc"].get(timeframe, "60m")
     url = f"{MEXC_BASE}/api/v3/klines"
-    r   = requests.get(url, params={"symbol":symbol,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
+    r   = _http.get(url, params={"symbol":symbol,"interval":tf,"limit":min(limit,1000)}, timeout=TIMEOUT)
     r.raise_for_status()
     raw = r.json()
     if not isinstance(raw, list) or len(raw) == 0:
@@ -124,7 +129,7 @@ def mexc_candles(symbol: str, timeframe="1h", limit=300) -> pd.DataFrame:
 
 
 def mexc_tickers() -> list:
-    r = requests.get(f"{MEXC_BASE}/api/v3/ticker/24hr", timeout=TIMEOUT)
+    r = _http.get(f"{MEXC_BASE}/api/v3/ticker/24hr", timeout=TIMEOUT)
     r.raise_for_status()
     d = r.json()
     if not isinstance(d, list):
@@ -135,25 +140,88 @@ def mexc_tickers() -> list:
 # ══════════════════════════════════════════
 # INTERFACE UNIFICADA
 # ══════════════════════════════════════════
-def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto") -> pd.DataFrame:
+def obter_candles(symbol: str, timeframe="1h", limit=300, exchange="auto",
+                  fechados=True, preferida=None) -> pd.DataFrame:
+    """
+    fechados=True descarta o último candle, que ainda está em formação
+    (volume parcial e corpo/sombras que ainda vão mudar).
+    preferida: exchange tentada primeiro no modo "auto" (ex.: onde o par foi listado).
+    """
+    def _limpar(df):
+        return df.iloc[:-1].reset_index(drop=True) if fechados else df
+
     mapa = {"bitget":bitget_candles,"mexc":mexc_candles,"bingx":bingx_candles}
     if exchange != "auto":
-        return mapa[exchange](symbol, timeframe, limit)
+        return _limpar(mapa[exchange](symbol, timeframe, limit))
+    ordem = sorted(mapa, key=lambda nome: nome != preferida)
     erros = {}
-    for nome, func in [("bitget",bitget_candles),("mexc",mexc_candles),("bingx",bingx_candles)]:
+    for nome in ordem:
+        func = mapa[nome]
         try:
             df = func(symbol, timeframe, limit)
-            if df is not None and len(df) >= 50:
-                return df
+            if df is not None and len(df) >= 51:
+                return _limpar(df)
         except Exception as e:
             erros[nome] = str(e)
     raise ConnectionError(f"Todas exchanges falharam para {symbol}:\n"+"\n".join(f"  {k}: {v}" for k,v in erros.items()))
 
 
 # ══════════════════════════════════════════
+# MARKET CAP (CoinGecko)
+# ══════════════════════════════════════════
+_MCAP_CACHE_TTL = 6 * 3600
+_mcap_cache = {"ts": 0.0, "simbolos": None}
+_mcap_lock  = threading.Lock()
+
+
+def _simbolos_por_mcap(mcap_min=MCAP_MIN, mcap_max=MCAP_MAX, max_paginas=12):
+    """
+    Retorna o set de símbolos (ex.: {"PEPE", "WIF"}) com market cap entre
+    mcap_min e mcap_max, ou None se a CoinGecko estiver indisponível.
+    Resultado fica em cache por 6h (market cap muda devagar).
+    """
+    with _mcap_lock:
+        if _mcap_cache["simbolos"] is not None and time.time() - _mcap_cache["ts"] < _MCAP_CACHE_TTL:
+            return _mcap_cache["simbolos"]
+
+        headers  = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+        simbolos = set()
+        try:
+            for pagina in range(1, max_paginas + 1):
+                params = {"vs_currency": "usd", "order": "market_cap_desc",
+                          "per_page": 250, "page": pagina}
+                r = _http.get(f"{COINGECKO_BASE}/coins/markets", params=params,
+                                 headers=headers, timeout=TIMEOUT)
+                if r.status_code == 429:  # rate limit do plano gratuito
+                    time.sleep(30)
+                    r = _http.get(f"{COINGECKO_BASE}/coins/markets", params=params,
+                                     headers=headers, timeout=TIMEOUT)
+                r.raise_for_status()
+                moedas = r.json()
+                if not moedas:
+                    break
+                for c in moedas:
+                    mcap = c.get("market_cap") or 0
+                    if mcap_min <= mcap <= mcap_max:
+                        simbolos.add(str(c.get("symbol", "")).upper())
+                # Ordenado por mcap desc: ao passar do mínimo, acabou
+                if (moedas[-1].get("market_cap") or 0) < mcap_min:
+                    break
+                time.sleep(2.5)
+        except Exception as e:
+            log.warning(f"⚠️ CoinGecko indisponível ({e}) — filtro de market cap desativado neste ciclo.")
+            return None
+
+        _mcap_cache.update(ts=time.time(), simbolos=simbolos)
+        log.info(f"✅ CoinGecko: {len(simbolos)} moedas entre ${mcap_min:,.0f} e ${mcap_max:,.0f}")
+        return simbolos
+
+
+# ══════════════════════════════════════════
 # LISTAR LOWCAPS
 # ══════════════════════════════════════════
-def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> list:
+def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True,
+                   filtrar_mcap=True) -> list:
     if exchanges is None:
         exchanges = ["bitget","mexc","bingx"]
     resultados = []
@@ -169,7 +237,7 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> lis
                         "price":float(t.get("lastPr",0) or 0),
                         "change24h":round(float(t.get("change24h",0) or 0)*100,2)})
         except Exception as e:
-            print(f"⚠️ Bitget: {e}")
+            log.warning(f"⚠️ Bitget tickers: {e}")
 
     if "mexc" in exchanges:
         try:
@@ -182,7 +250,7 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> lis
                         "price":float(t.get("lastPrice",0) or 0),
                         "change24h":round(float(t.get("priceChangePercent",0) or 0),2)})
         except Exception as e:
-            print(f"⚠️ MEXC: {e}")
+            log.warning(f"⚠️ MEXC tickers: {e}")
 
     if "bingx" in exchanges:
         try:
@@ -195,13 +263,19 @@ def listar_lowcaps(vol_min=MIN_VOL_24H, exchanges=None, apenas_usdt=True) -> lis
                         "price":float(t.get("lastPrice",0) or 0),
                         "change24h":round(float(t.get("priceChangePercent",0) or 0),2)})
         except Exception as e:
-            print(f"⚠️ BingX: {e}")
+            log.warning(f"⚠️ BingX tickers: {e}")
 
     seen = {}
     for r in sorted(resultados, key=lambda x: x["volume"], reverse=True):
         if r["symbol"] not in seen:
             seen[r["symbol"]] = r
-    print(f"✅ {len(seen)} lowcaps encontradas.")
+
+    if filtrar_mcap:
+        permitidos = _simbolos_por_mcap()
+        if permitidos is not None:
+            seen = {s: r for s, r in seen.items()
+                    if s.removesuffix("USDT") in permitidos}
+    log.info(f"✅ {len(seen)} lowcaps encontradas.")
     return list(seen.values())
 
 
@@ -223,12 +297,9 @@ def _norm_okx(symbol: str) -> str:
     return sym
 
 
-def _norm_bitget(symbol: str) -> str:
-    return symbol.upper().replace("-", "")
-
-
 # ── OKX WebSocket ──────────────────────────────────────────────
-def _iniciar_ws_okx():
+def iniciar_ws_okx():
+    """Inicia (uma vez) a thread do WebSocket de liquidações da OKX."""
     global _okx_ativo
 
     if not _WEBSOCKET_DISPONIVEL:
@@ -302,36 +373,51 @@ def _iniciar_ws_okx():
     log.info("🚀 OKX WebSocket de liquidações iniciado")
 
 
-_iniciar_ws_okx()
-
-
 # ── Bitfinex REST ──────────────────────────────────────────────
-def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
+def _base_bitfinex(sym_bfx: str) -> str:
+    """'tBTCF0:USTF0' → 'BTC' | 'tETHUSD' → 'ETH'."""
+    s = sym_bfx[1:] if sym_bfx.startswith("t") else sym_bfx
+    s = s.upper().split(":")[0]
+    s = s.removesuffix("F0")
+    for quote in ("UST", "USD"):
+        if s.endswith(quote) and len(s) > len(quote):
+            s = s[:-len(quote)]
+            break
+    return s
+
+
+def _liquidacoes_bitfinex(symbol: str, limit: int = 100) -> list[dict]:
+    """
+    Formato da API (cada item vem embrulhado numa lista):
+    [[ "pos", POS_ID, MTS, _, SYMBOL, AMOUNT, BASE_PRICE, _, IS_MATCH,
+       IS_MARKET_SOLD, _, PRICE_ACQUIRED ], ...]
+    AMOUNT > 0 → posição LONG liquidada.
+    """
     try:
         url = "https://api-pub.bitfinex.com/v2/liquidations/hist"
-        r   = requests.get(url, params={"limit": limit, "sort": -1}, timeout=6)
+        r   = _http.get(url, params={"limit": limit, "sort": -1}, timeout=6)
         r.raise_for_status()
+        base_req = symbol.upper().removesuffix("USDT").removesuffix("USD")
         eventos = []
         for item in r.json():
-            if not isinstance(item, list) or len(item) < 6:
+            if isinstance(item, list) and item and isinstance(item[0], list):
+                item = item[0]
+            if not isinstance(item, list) or len(item) < 7 or item[0] != "pos":
                 continue
-            sym_bfx = str(item[3]).upper()
-            amount  = abs(float(item[4]))
-            price   = float(item[11]) if len(item) > 11 and item[11] else float(item[5])
-            lado    = "LONG" if float(item[4]) > 0 else "SHORT"
-            usd     = amount * price
-            ts_ms   = int(item[1])
+            if _base_bitfinex(str(item[4])) != base_req:
+                continue
+            amount_raw = float(item[5] or 0)
+            amount     = abs(amount_raw)
+            price      = float(item[11]) if len(item) > 11 and item[11] else float(item[6] or 0)
+            usd        = amount * price
             if usd < 500:
                 continue
-            base_req = symbol.upper().replace("USDT","").replace("USD","")
-            if base_req not in sym_bfx:
-                continue
             eventos.append({
-                "lado":  lado,
+                "lado":  "LONG" if amount_raw > 0 else "SHORT",
                 "qty":   amount,
                 "price": price,
                 "usd":   usd,
-                "ts":    datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+                "ts":    datetime.fromtimestamp(int(item[2]) / 1000, tz=timezone.utc),
                 "fonte": "Bitfinex",
             })
         return eventos
@@ -340,67 +426,27 @@ def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
         return []
 
 
-# ── Bitget REST ────────────────────────────────────────────────
-def _liquidacoes_bitget(symbol: str, limit: int = 20) -> list[dict]:
-    try:
-        sym = _norm_bitget(symbol)
-        url = "https://api.bitget.com/api/v2/mix/market/fills-history"
-        r   = requests.get(
-            url,
-            params={"symbol": sym, "productType": "USDT-FUTURES", "limit": limit},
-            timeout=6,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") != "00000":
-            return []
-        eventos = []
-        for t in data.get("data", []):
-            price = float(t.get("price", 0))
-            size  = float(t.get("size",  0))
-            usd   = price * size
-            side  = t.get("side", "").upper()
-            if usd < 5000:
-                continue
-            eventos.append({
-                "lado":  "LONG" if "BUY" in side else "SHORT",
-                "qty":   size,
-                "price": price,
-                "usd":   usd,
-                "ts":    datetime.fromtimestamp(int(t.get("ts", 0)) / 1000, tz=timezone.utc),
-                "fonte": "Bitget",
-            })
-        return eventos
-    except Exception as e:
-        log.debug(f"Bitget fills erro: {e}")
-        return []
-
-
 # ── Função principal ───────────────────────────────────────────
 def obter_liquidacoes(symbol: str, janela_minutos: int = 60) -> str:
     sym   = symbol.upper().replace("-", "")
     agora = datetime.now(timezone.utc)
 
+    def na_janela(eventos):
+        return [e for e in eventos
+                if (agora - e["ts"]).total_seconds() <= janela_minutos * 60]
+
     with _liq_lock:
         cache = list(_liq_cache.get(sym, []))
-    recentes = [
-        e for e in cache
-        if (agora - e["ts"]).total_seconds() <= janela_minutos * 60
-    ]
+    recentes    = na_janela(cache)
     fonte_usada = "OKX" if recentes else None
 
     if not recentes:
-        recentes = _liquidacoes_bitfinex(sym)
+        recentes = na_janela(_liquidacoes_bitfinex(sym))
         if recentes:
             fonte_usada = "Bitfinex"
 
     if not recentes:
-        recentes = _liquidacoes_bitget(sym)
-        if recentes:
-            fonte_usada = "Bitget (proxy fills)"
-
-    if not recentes:
-        return "Sem liquidacoes significativas na ultima hora."
+        return f"Sem liquidacoes significativas nos ultimos {janela_minutos}min."
 
     longs  = [e for e in recentes if e["lado"] == "LONG"]
     shorts = [e for e in recentes if e["lado"] == "SHORT"]
