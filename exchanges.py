@@ -281,10 +281,6 @@ def _norm_okx(symbol: str) -> str:
     return sym
 
 
-def _norm_bitget(symbol: str) -> str:
-    return symbol.upper().replace("-", "")
-
-
 # ── OKX WebSocket ──────────────────────────────────────────────
 def _iniciar_ws_okx():
     global _okx_ativo
@@ -364,32 +360,50 @@ _iniciar_ws_okx()
 
 
 # ── Bitfinex REST ──────────────────────────────────────────────
-def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
+def _base_bitfinex(sym_bfx: str) -> str:
+    """'tBTCF0:USTF0' → 'BTC' | 'tETHUSD' → 'ETH'."""
+    s = sym_bfx[1:] if sym_bfx.startswith("t") else sym_bfx
+    s = s.upper().split(":")[0]
+    s = s.removesuffix("F0")
+    for quote in ("UST", "USD"):
+        if s.endswith(quote) and len(s) > len(quote):
+            s = s[:-len(quote)]
+            break
+    return s
+
+
+def _liquidacoes_bitfinex(symbol: str, limit: int = 100) -> list[dict]:
+    """
+    Formato da API (cada item vem embrulhado numa lista):
+    [[ "pos", POS_ID, MTS, _, SYMBOL, AMOUNT, BASE_PRICE, _, IS_MATCH,
+       IS_MARKET_SOLD, _, PRICE_ACQUIRED ], ...]
+    AMOUNT > 0 → posição LONG liquidada.
+    """
     try:
         url = "https://api-pub.bitfinex.com/v2/liquidations/hist"
         r   = requests.get(url, params={"limit": limit, "sort": -1}, timeout=6)
         r.raise_for_status()
+        base_req = symbol.upper().removesuffix("USDT").removesuffix("USD")
         eventos = []
         for item in r.json():
-            if not isinstance(item, list) or len(item) < 6:
+            if isinstance(item, list) and item and isinstance(item[0], list):
+                item = item[0]
+            if not isinstance(item, list) or len(item) < 7 or item[0] != "pos":
                 continue
-            sym_bfx = str(item[3]).upper()
-            amount  = abs(float(item[4]))
-            price   = float(item[11]) if len(item) > 11 and item[11] else float(item[5])
-            lado    = "LONG" if float(item[4]) > 0 else "SHORT"
-            usd     = amount * price
-            ts_ms   = int(item[1])
+            if _base_bitfinex(str(item[4])) != base_req:
+                continue
+            amount_raw = float(item[5] or 0)
+            amount     = abs(amount_raw)
+            price      = float(item[11]) if len(item) > 11 and item[11] else float(item[6] or 0)
+            usd        = amount * price
             if usd < 500:
                 continue
-            base_req = symbol.upper().replace("USDT","").replace("USD","")
-            if base_req not in sym_bfx:
-                continue
             eventos.append({
-                "lado":  lado,
+                "lado":  "LONG" if amount_raw > 0 else "SHORT",
                 "qty":   amount,
                 "price": price,
                 "usd":   usd,
-                "ts":    datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+                "ts":    datetime.fromtimestamp(int(item[2]) / 1000, tz=timezone.utc),
                 "fonte": "Bitfinex",
             })
         return eventos
@@ -398,67 +412,27 @@ def _liquidacoes_bitfinex(symbol: str, limit: int = 20) -> list[dict]:
         return []
 
 
-# ── Bitget REST ────────────────────────────────────────────────
-def _liquidacoes_bitget(symbol: str, limit: int = 20) -> list[dict]:
-    try:
-        sym = _norm_bitget(symbol)
-        url = "https://api.bitget.com/api/v2/mix/market/fills-history"
-        r   = requests.get(
-            url,
-            params={"symbol": sym, "productType": "USDT-FUTURES", "limit": limit},
-            timeout=6,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") != "00000":
-            return []
-        eventos = []
-        for t in data.get("data", []):
-            price = float(t.get("price", 0))
-            size  = float(t.get("size",  0))
-            usd   = price * size
-            side  = t.get("side", "").upper()
-            if usd < 5000:
-                continue
-            eventos.append({
-                "lado":  "LONG" if "BUY" in side else "SHORT",
-                "qty":   size,
-                "price": price,
-                "usd":   usd,
-                "ts":    datetime.fromtimestamp(int(t.get("ts", 0)) / 1000, tz=timezone.utc),
-                "fonte": "Bitget",
-            })
-        return eventos
-    except Exception as e:
-        log.debug(f"Bitget fills erro: {e}")
-        return []
-
-
 # ── Função principal ───────────────────────────────────────────
 def obter_liquidacoes(symbol: str, janela_minutos: int = 60) -> str:
     sym   = symbol.upper().replace("-", "")
     agora = datetime.now(timezone.utc)
 
+    def na_janela(eventos):
+        return [e for e in eventos
+                if (agora - e["ts"]).total_seconds() <= janela_minutos * 60]
+
     with _liq_lock:
         cache = list(_liq_cache.get(sym, []))
-    recentes = [
-        e for e in cache
-        if (agora - e["ts"]).total_seconds() <= janela_minutos * 60
-    ]
+    recentes    = na_janela(cache)
     fonte_usada = "OKX" if recentes else None
 
     if not recentes:
-        recentes = _liquidacoes_bitfinex(sym)
+        recentes = na_janela(_liquidacoes_bitfinex(sym))
         if recentes:
             fonte_usada = "Bitfinex"
 
     if not recentes:
-        recentes = _liquidacoes_bitget(sym)
-        if recentes:
-            fonte_usada = "Bitget (proxy fills)"
-
-    if not recentes:
-        return "Sem liquidacoes significativas na ultima hora."
+        return f"Sem liquidacoes significativas nos ultimos {janela_minutos}min."
 
     longs  = [e for e in recentes if e["lado"] == "LONG"]
     shorts = [e for e in recentes if e["lado"] == "SHORT"]
